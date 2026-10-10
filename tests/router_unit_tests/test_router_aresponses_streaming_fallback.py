@@ -373,6 +373,108 @@ async def test_aresponses_fallback_on_in_stream_error_event():
 
 
 @pytest.mark.asyncio
+async def test_aresponses_fallback_with_dict_completed_response_usage():
+    import json
+    from unittest.mock import Mock
+
+    from litellm.exceptions import MidStreamFallbackError
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+    from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
+    from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator
+    from litellm.types.llms.openai import ErrorEvent, ErrorEventError
+
+    router = _make_router()
+    events = [
+        {"type": "response.output_text.delta", "delta": "partial answer"},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+            },
+        },
+        {"type": "error", "error": {"type": "tokens", "code": "rate_limit_exceeded", "message": "rate limited"}},
+    ]
+    sse_payload = b"".join(f"data: {json.dumps(event)}\n\n".encode() for event in events)
+
+    async def mock_aiter_bytes():
+        yield sse_payload
+
+    mock_response = Mock()
+    mock_response.headers = {}
+    mock_response.aiter_bytes = mock_aiter_bytes
+    mock_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
+    mock_logging_obj.model_call_details = {"litellm_params": {}}
+    mock_logging_obj.completion_start_time = None
+    mock_config = Mock(spec=BaseResponsesAPIConfig)
+
+    def transform(model, parsed_chunk, logging_obj):
+        if parsed_chunk["type"] == "error":
+            return ErrorEvent(
+                type=ResponsesAPIStreamEvents.ERROR,
+                sequence_number=2,
+                error=ErrorEventError(**parsed_chunk["error"]),
+            )
+        if parsed_chunk["type"] == "response.output_text.delta":
+            delta_event = Mock()
+            delta_event.type = ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA
+            delta_event.delta = parsed_chunk["delta"]
+            return delta_event
+        return ResponseCompletedEvent.model_construct(
+            type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+            response=parsed_chunk["response"],
+        )
+
+    mock_config.transform_streaming_response.side_effect = transform
+    source = ResponsesAPIStreamingIterator(
+        response=mock_response,
+        model="gpt-6.1-sol",
+        responses_api_provider_config=mock_config,
+        logging_obj=mock_logging_obj,
+        custom_llm_provider="openai",
+    )
+    fallback_event = _make_completed_event(1, 1, 2)
+
+    class _FallbackStream:
+        def __init__(self) -> None:
+            self._done = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._done:
+                raise StopAsyncIteration
+            self._done = True
+            return fallback_event
+
+    with patch.object(
+        router,
+        "async_function_with_fallbacks_common_utils",
+        new=AsyncMock(return_value=_FallbackStream()),
+    ) as mock_fallback:
+        wrapped = await router._aresponses_streaming_iterator(
+            response=source,
+            initial_kwargs={"model": "primary", "input": "original question"},
+        )
+        collected = [event async for event in wrapped]
+
+    assert [event.type for event in collected] == [
+        ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
+        ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+        ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+    ]
+    raised = mock_fallback.await_args.kwargs["e"]
+    assert isinstance(raised, MidStreamFallbackError)
+    assert raised.status_code == 429
+    combined_usage = fallback_event.response.usage
+    assert combined_usage is not None
+    assert combined_usage.input_tokens == 12
+    assert combined_usage.output_tokens == 8
+    assert combined_usage.total_tokens == 20
+
+
+@pytest.mark.asyncio
 async def test_aresponses_fallback_uses_continuation_input_after_partial_content():
     """When output text was already streamed before the error, the fallback re-entry
     must carry a continuation input with the partial assistant text instead of
