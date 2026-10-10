@@ -81,6 +81,27 @@ def test_extract_partial_responses_usage_native_completed():
     assert usage.total_tokens == 18
 
 
+def test_extract_partial_responses_usage_native_dict_completed():
+    completed = ResponseCompletedEvent.model_construct(
+        type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+        response={
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+            }
+        },
+    )
+    source = MagicMock()
+    source.completed_response = completed
+
+    usage = Router._extract_partial_responses_usage(source)
+    assert usage is not None
+    assert usage.input_tokens == 11
+    assert usage.output_tokens == 7
+    assert usage.total_tokens == 18
+
+
 def test_extract_partial_responses_usage_no_completed_response():
     """Native path: no completed_response → returns None."""
     source = MagicMock()

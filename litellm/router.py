@@ -2265,7 +2265,16 @@ class Router:
             completed,
             (ResponseCompletedEvent, ResponseFailedEvent, ResponseIncompleteEvent),
         ):
-            return completed.response.usage
+            response = completed.response
+            if isinstance(response, dict):
+                usage = response.get("usage")
+                if isinstance(usage, dict):
+                    try:
+                        return ResponseAPIUsage(**usage)
+                    except Exception:
+                        return None
+                return usage if isinstance(usage, ResponseAPIUsage) else None
+            return response.usage
         return None
 
     @staticmethod
