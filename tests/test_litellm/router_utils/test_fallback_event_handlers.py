@@ -315,7 +315,7 @@ def test_fallback_attempt_key_is_stable_across_key_order():
 
 @pytest.mark.parametrize(
     "extra, expected",
-    [([], ["fb1", "fb2"]), ([{"fb1": []}], []), ([{"fb1": ["own-backup"]}], ["own-backup"])],
+    [([], ["fb1", "fb2"]), ([{"fb1": []}], ["fb1", "fb2"]), ([{"fb1": ["own-backup"]}], ["own-backup"])],
 )
 @pytest.mark.parametrize("generic_first", [False, True])
 def test_streaming_hop_resumes_original_chain_after_specific_lookup(extra, expected, generic_first):
@@ -341,3 +341,24 @@ def test_streaming_controls_share_tracker_without_trusting_a_caller_dict():
     assert request_fallback_targets(snapshot, "backup") is tracker
     assert fallback_lookup_groups(snapshot, "backup") == ("backup", "primary")
     assert "backup" in tracker
+
+
+def test_direct_request_with_empty_chain_does_not_inherit_another_groups_fallbacks():
+    kwargs = {"attempted_targets": request_fallback_targets({}, "fb1")}
+    fallbacks = [{"primary": ["fb1", "fb2"]}, {"fb1": []}, {"*": ["generic-backup"]}]
+    resolved, _ = get_fallback_model_group_for_lookup_groups(fallbacks, fallback_lookup_groups(kwargs, "fb1"))
+    assert resolved == []
+
+
+def test_empty_candidate_chain_resumes_the_original_generic_chain():
+    kwargs = {"attempted_targets": request_fallback_targets({}, "primary")}
+    fallbacks = [{"*": ["fb1", "fb2"]}, {"fb1": []}]
+    resolved, _ = get_fallback_model_group_for_lookup_groups(fallbacks, fallback_lookup_groups(kwargs, "fb1"))
+    assert resolved == ["fb1", "fb2"]
+
+
+def test_empty_original_chain_still_blocks_a_candidates_generic_chain():
+    kwargs = {"attempted_targets": request_fallback_targets({}, "primary")}
+    fallbacks = [{"*": ["generic-backup"]}, {"primary": []}]
+    resolved, _ = get_fallback_model_group_for_lookup_groups(fallbacks, fallback_lookup_groups(kwargs, "fb1"))
+    assert resolved == []

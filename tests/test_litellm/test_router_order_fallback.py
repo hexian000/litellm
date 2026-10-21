@@ -692,12 +692,14 @@ async def test_order_fallback_attempts_each_target_once_over_http(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", ["chat", "responses"])
 @pytest.mark.parametrize("request_overrides", [False, True])
+@pytest.mark.parametrize("explicit_empty", [False, True])
 @pytest.mark.parametrize("ordered", [False, True])
 @pytest.mark.parametrize("primary_streams", [False, True])
 @pytest.mark.parametrize("exhausted", [False, True])
 async def test_streaming_fallback_walks_remaining_targets_over_http(
     endpoint: str,
     request_overrides: bool,
+    explicit_empty: bool,
     ordered: bool,
     primary_streams: bool,
     exhausted: bool,
@@ -717,9 +719,9 @@ async def test_streaming_fallback_walks_remaining_targets_over_http(
             assert body["messages"] == [{"role": "user", "content": "hi"}]
         else:
             assert body["input"] == "hi"
-        if model.startswith("group-a-") and not primary_streams:
+        if model.startswith("gpt-6.1-sol-") and not primary_streams:
             return httpx.Response(500, json={"error": {"message": "primary unavailable", "type": "server_error"}})
-        if not model.startswith("group-d-") or exhausted:
+        if not model.startswith("gemini-3.8-flash-high-") or exhausted:
             error = {"message": "stream overloaded", "type": "server_error", "code": "500"}
             event = {"error": error} if endpoint == "chat" else {"type": "error", "error": error}
             return httpx.Response(
@@ -753,12 +755,17 @@ async def test_streaming_fallback_walks_remaining_targets_over_http(
             text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
         )
 
-    groups = (("a", (1, 2, 3) if ordered else (1,)), ("b", (1, 2, 3) if ordered else (1,)), ("c", (1,)), ("d", (1,)))
+    groups = (
+        ("openai/gpt-6.1-sol", (1, 2, 3) if ordered else (1,)),
+        ("openai/gpt-6-sol", (1, 2, 3) if ordered else (1,)),
+        ("openai/gpt-5.6-sol", (1,)),
+        ("google/gemini-3.8-flash-high", (1,)),
+    )
     deployments = [
         {
-            "model_name": f"openai/group-{group}",
+            "model_name": group,
             "litellm_params": {
-                "model": f"openai/group-{group}-{order}",
+                "model": f"openai/{group.split('/')[-1]}-{order}",
                 "api_key": "key",
                 "api_base": "http://upstream.test/v1",
                 "order": order,
@@ -768,11 +775,13 @@ async def test_streaming_fallback_walks_remaining_targets_over_http(
         for group, orders in groups
         for order in orders
     ]
-    fallbacks = [{"group-a": ["openai/group-b", "openai/group-c", "openai/group-d"]}]
+    fallbacks = [{"gpt-6.1-sol": [group for group, _ in groups[1:]]}] + (
+        [{group: []} for group, _ in groups] if explicit_empty else []
+    )
     router = Router(
         model_list=deployments,
-        model_group_alias={"group-a": "openai/group-a"},
-        fallbacks=[{"group-a": ["missing-group"]}] if request_overrides else fallbacks,
+        model_group_alias={"gpt-6.1-sol": "openai/gpt-6.1-sol"},
+        fallbacks=[{"gpt-6.1-sol": ["missing-group"]}] if request_overrides else fallbacks,
         num_retries=0,
         max_fallbacks=20,
         disable_cooldowns=True,
@@ -792,7 +801,7 @@ async def test_streaming_fallback_walks_remaining_targets_over_http(
                 async def consume() -> tuple:
                     if endpoint == "chat":
                         response = await router.acompletion(
-                            model="group-a",
+                            model="gpt-6.1-sol",
                             messages=[{"role": "user", "content": "hi"}],
                             stream=True,
                             client=client,
@@ -800,7 +809,7 @@ async def test_streaming_fallback_walks_remaining_targets_over_http(
                         )
                     else:
                         response = await router.aresponses(
-                            model="group-a",
+                            model="gpt-6.1-sol",
                             input="hi",
                             stream=True,
                             client=client,
@@ -820,7 +829,7 @@ async def test_streaming_fallback_walks_remaining_targets_over_http(
                         assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "ok"
                     else:
                         assert chunks[-1].type == "response.completed"
-                        assert chunks[-1].response.model == "group-d-1"
+                        assert chunks[-1].response.model == "gemini-3.8-flash-high-1"
         finally:
             router.reset()
-    assert attempts == [f"group-{group}-{order}" for group, orders in groups for order in orders] * 2
+    assert attempts == [f"{group.split('/')[-1]}-{order}" for group, orders in groups for order in orders] * 2

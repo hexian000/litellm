@@ -83,10 +83,12 @@ def get_fallback_model_group_for_lookup_groups(
     fallbacks: Sequence[str | Mapping[str, Sequence[str]]], lookup_groups: tuple[str, ...]
 ) -> tuple[list[str] | None, int | None]:
     results: Final = tuple(get_fallback_model_group(fallbacks, group) for group in lookup_groups)
-    specific: Final = next((result for result in results if _resolved_specific_chain(fallbacks, result)), None)
+    specific: Final = next(
+        (result for result in results if result[0] and _resolved_specific_chain(fallbacks, result)), None
+    )
     if specific is not None:
         return specific
-    return next((result for result in results if result[0] is not None), (None, None))
+    return next((result for result in reversed(results) if result[0] is not None), (None, None))
 
 
 def _resolved_specific_chain(
