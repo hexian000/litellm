@@ -2336,7 +2336,7 @@ async def test_aresponses_streaming_iterator_fallback():
     call_kwargs = mock_fallback_utils.call_args.kwargs
     fbk = call_kwargs["kwargs"]
     # Bound methods compare equal when they share the same instance + __func__.
-    assert fbk["original_function"] == router._ageneric_api_call_with_fallbacks_helper
+    assert fbk["original_function"] == router._ageneric_api_call_with_fallbacks_responses_attempt
     assert fbk["original_generic_function"] is litellm.aresponses
     assert call_kwargs["model_group"] == "anthropic/claude-sonnet-4-6"
     assert call_kwargs["disable_fallbacks"] is False

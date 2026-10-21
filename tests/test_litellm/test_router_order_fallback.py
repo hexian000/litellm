@@ -687,3 +687,140 @@ async def test_order_fallback_attempts_each_target_once_over_http(
         )
         * 2
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["chat", "responses"])
+@pytest.mark.parametrize("request_overrides", [False, True])
+@pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize("primary_streams", [False, True])
+@pytest.mark.parametrize("exhausted", [False, True])
+async def test_streaming_fallback_walks_remaining_targets_over_http(
+    endpoint: str,
+    request_overrides: bool,
+    ordered: bool,
+    primary_streams: bool,
+    exhausted: bool,
+    respx_mock,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    attempts: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        model = body["model"]
+        attempts.append(model)
+        assert set(body) <= {"model", "messages", "input", "stream", "stream_options", "metadata"}
+        assert "attempted_targets" not in body.get("metadata", {})
+        if endpoint == "chat":
+            assert body["messages"] == [{"role": "user", "content": "hi"}]
+        else:
+            assert body["input"] == "hi"
+        if model.startswith("group-a-") and not primary_streams:
+            return httpx.Response(500, json={"error": {"message": "primary unavailable", "type": "server_error"}})
+        if not model.startswith("group-d-") or exhausted:
+            error = {"message": "stream overloaded", "type": "server_error", "code": "500"}
+            event = {"error": error} if endpoint == "chat" else {"type": "error", "error": error}
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, text=f"data: {json.dumps(event)}\n\n"
+            )
+        if endpoint == "chat":
+            event = {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+            }
+        else:
+            event = {
+                "type": "response.completed",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp_test",
+                    "object": "response",
+                    "created_at": 0,
+                    "model": model,
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
+        )
+
+    groups = (("a", (1, 2, 3) if ordered else (1,)), ("b", (1, 2, 3) if ordered else (1,)), ("c", (1,)), ("d", (1,)))
+    deployments = [
+        {
+            "model_name": f"openai/group-{group}",
+            "litellm_params": {
+                "model": f"openai/group-{group}-{order}",
+                "api_key": "key",
+                "api_base": "http://upstream.test/v1",
+                "order": order,
+            },
+            "model_info": {"id": f"{group}-{order}"},
+        }
+        for group, orders in groups
+        for order in orders
+    ]
+    fallbacks = [{"group-a": ["openai/group-b", "openai/group-c", "openai/group-d"]}]
+    router = Router(
+        model_list=deployments,
+        model_group_alias={"group-a": "openai/group-a"},
+        fallbacks=[{"group-a": ["missing-group"]}] if request_overrides else fallbacks,
+        num_retries=0,
+        max_fallbacks=20,
+        disable_cooldowns=True,
+    )
+    if endpoint == "responses":
+        respx_mock.post("http://upstream.test/v1/responses").mock(side_effect=upstream)
+    async with AsyncOpenAI(
+        api_key="key",
+        base_url="http://upstream.test/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+    ) as client:
+        try:
+            for _ in range(2):
+                overrides = {"fallbacks": fallbacks} if request_overrides else {}
+
+                async def consume() -> tuple:
+                    if endpoint == "chat":
+                        response = await router.acompletion(
+                            model="group-a",
+                            messages=[{"role": "user", "content": "hi"}],
+                            stream=True,
+                            client=client,
+                            **overrides,
+                        )
+                    else:
+                        response = await router.aresponses(
+                            model="group-a",
+                            input="hi",
+                            stream=True,
+                            client=client,
+                            **overrides,
+                        )
+                    return tuple([item async for item in response])
+
+                if exhausted:
+                    with pytest.raises(
+                        (litellm.APIError, litellm.APIConnectionError, litellm.InternalServerError),
+                        match="stream overloaded",
+                    ):
+                        await consume()
+                else:
+                    chunks = await consume()
+                    if endpoint == "chat":
+                        assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "ok"
+                    else:
+                        assert chunks[-1].type == "response.completed"
+                        assert chunks[-1].response.model == "group-d-1"
+        finally:
+            router.reset()
+    assert attempts == [f"group-{group}-{order}" for group, orders in groups for order in orders] * 2

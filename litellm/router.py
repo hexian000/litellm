@@ -19,7 +19,7 @@ import threading
 import time
 import traceback
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Callable, Generator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Mapping
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -128,8 +128,11 @@ from litellm.router_utils.cooldown_handlers import (
 )
 from litellm.router_utils.fallback_event_handlers import (
     _check_non_standard_fallback_format,
-    get_fallback_model_group,
+    fallback_lookup_groups,
+    get_fallback_model_group_for_lookup_groups,
+    request_fallback_targets,
     run_async_fallback,
+    streaming_fallback_kwargs,
 )
 from litellm.router_utils.get_retry_from_policy import (
     get_num_retries_from_retry_policy as _get_num_retries_from_retry_policy,
@@ -2545,7 +2548,7 @@ class Router:
                     # _ageneric_api_call_with_fallbacks_helper.
                     # original_generic_function is preserved by the caller so
                     # the helper knows what underlying API to invoke per attempt.
-                    initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+                    initial_kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_responses_attempt
                     if e.is_pre_first_chunk or not e.generated_content:
                         # No content generated before the error — retry with the
                         # original input. Adding a continuation prompt would
@@ -2779,8 +2782,7 @@ class Router:
         deployment = None
         _timeout_debug_deployment_dict = {}  # this is a temporary dict to debug timeout issues
         try:
-            input_kwargs_for_streaming_fallback = kwargs.copy()
-            input_kwargs_for_streaming_fallback["model"] = model
+            input_kwargs_for_streaming_fallback = streaming_fallback_kwargs(model, kwargs)
 
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
             start_time = time.time()
@@ -4413,19 +4415,23 @@ class Router:
             ),
         )
 
-    async def _ageneric_api_call_with_fallbacks(self, model: str, original_function: Callable, **kwargs):
+    async def _ageneric_api_call_with_fallbacks(
+        self,
+        model: str,
+        original_function: Callable,
+        attempt_function: Callable[..., Awaitable[object]] | None = None,
+        **kwargs,
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
         try:
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
-            kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+            kwargs["original_function"] = attempt_function or self._ageneric_api_call_with_fallbacks_helper
             self._update_kwargs_before_fallbacks(model=model, kwargs=kwargs, metadata_variable_name="litellm_metadata")
             verbose_router_logger.debug(f"Inside ageneric_api_call_with_fallbacks() - model: {model}; kwargs: {kwargs}")
             response = await self.async_function_with_fallbacks(**kwargs)
-            return response
-
             return response
         except Exception as e:
             asyncio.create_task(
@@ -4568,6 +4574,18 @@ class Router:
         _aresponses_streaming_iterator so MidStreamFallbackError raised
         during iteration triggers the Router's cross-provider fallback chain.
         """
+        return await self._ageneric_api_call_with_fallbacks(
+            original_function=original_function,
+            attempt_function=self._ageneric_api_call_with_fallbacks_responses_attempt,
+            **kwargs,
+        )
+
+    async def _ageneric_api_call_with_fallbacks_responses_attempt(
+        self,
+        model: str,
+        original_generic_function: Callable[..., object],
+        **kwargs: object,
+    ) -> Union["ResponsesAPIResponse", "BaseResponsesAPIStreamingIterator"]:
         from litellm.litellm_core_utils.core_helpers import safe_deep_copy
         from litellm.responses.streaming_iterator import (
             BaseResponsesAPIStreamingIterator,
@@ -4588,14 +4606,16 @@ class Router:
         # fallback to the original reference for any non-picklable value.
         # The original_generic_function is preserved so the per-attempt
         # helper knows which underlying API to call on fallback.
-        fallback_kwargs: dict[str, Any] = kwargs.copy()
+        fallback_kwargs = streaming_fallback_kwargs(model, kwargs)
         if isinstance(fallback_kwargs.get("litellm_metadata"), dict):
             fallback_kwargs["litellm_metadata"] = safe_deep_copy(fallback_kwargs["litellm_metadata"])
         if isinstance(fallback_kwargs.get("metadata"), dict):
             fallback_kwargs["metadata"] = safe_deep_copy(fallback_kwargs["metadata"])
-        fallback_kwargs["original_generic_function"] = original_function
+        fallback_kwargs["original_generic_function"] = original_generic_function
 
-        response = await self._ageneric_api_call_with_fallbacks(original_function=original_function, **kwargs)
+        response = await self._ageneric_api_call_with_fallbacks_helper(
+            model=model, original_generic_function=original_generic_function, **kwargs
+        )
 
         if kwargs.get("stream") and isinstance(response, BaseResponsesAPIStreamingIterator):
             return await self._aresponses_streaming_iterator(
@@ -6174,9 +6194,9 @@ class Router:
                     # [{"model": "...", "messages": [...]}]) are passed through directly
                     external_fallback_group = fallbacks
                 else:
-                    external_fallback_group, generic_idx = get_fallback_model_group(
+                    external_fallback_group, generic_idx = get_fallback_model_group_for_lookup_groups(
                         fallbacks=fallbacks,
-                        model_group=cast(str, model_group),
+                        lookup_groups=fallback_lookup_groups(kwargs, model_group),
                     )
                     if external_fallback_group is None and generic_idx is not None:
                         external_fallback_group = fallbacks[generic_idx]["*"]
@@ -6301,9 +6321,9 @@ class Router:
                 (
                     fallback_model_group,
                     generic_fallback_idx,
-                ) = get_fallback_model_group(
+                ) = get_fallback_model_group_for_lookup_groups(
                     fallbacks=fallbacks,  # if fallbacks = [{"gpt-3.5-turbo": ["claude-3-haiku"]}]
-                    model_group=cast(str, model_group),
+                    lookup_groups=fallback_lookup_groups(kwargs, model_group),
                 )
                 ## if none, check for generic fallback
                 if fallback_model_group is None and generic_fallback_idx is not None:
@@ -6364,6 +6384,7 @@ class Router:
         If it fails after num_retries, fall back to another model group
         """
         model_group: str | None = kwargs.get("model")
+        kwargs["attempted_targets"] = request_fallback_targets(kwargs, model_group)
         include_fallback_errors = kwargs.get("include_fallback_errors", False) is True
         disable_fallbacks: bool | None = kwargs.pop("disable_fallbacks", False)
         fallbacks: list | None = kwargs.get("fallbacks", self.fallbacks)

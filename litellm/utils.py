@@ -4479,10 +4479,12 @@ def _get_deployment_order(deployment: dict | Any) -> int | None:
     Checks litellm_params first (static config), then model_info (dynamic/team
     models added via API where order lives in model_info, not litellm_params).
     """
-    order = deployment.get("litellm_params", {}).get("order")
-    if order is None:
-        order = deployment.get("model_info", {}).get("order")
-    return order
+    params = deployment.get("litellm_params")
+    order = params.get("order") if isinstance(params, dict) else None
+    if order is not None:
+        return order
+    model_info = deployment.get("model_info")
+    return model_info.get("order") if isinstance(model_info, dict) else None
 
 
 def _get_order_filtered_deployments(healthy_deployments: list[dict], target_order: int | None = None) -> list:

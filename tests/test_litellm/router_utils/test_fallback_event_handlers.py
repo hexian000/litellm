@@ -5,8 +5,12 @@ import pytest
 from litellm.router_utils.fallback_event_handlers import (
     AttemptedFallbackTargets,
     fallback_attempt_key,
+    fallback_lookup_groups,
     get_fallback_model_group,
+    get_fallback_model_group_for_lookup_groups,
+    request_fallback_targets,
     run_async_fallback,
+    streaming_fallback_kwargs,
 )
 
 
@@ -149,9 +153,7 @@ def test_get_fallback_model_group_does_not_mutate_fallbacks():
     fallbacks list, which is the live router config shared across requests."""
     fallbacks = [{"gpt-3.5-turbo": ["claude-3-haiku"]}, "gpt-4o-mini"]
 
-    fallback_model_group, _ = get_fallback_model_group(
-        fallbacks=fallbacks, model_group="unmatched-model"
-    )
+    fallback_model_group, _ = get_fallback_model_group(fallbacks=fallbacks, model_group="unmatched-model")
 
     assert fallback_model_group == ["gpt-4o-mini"]
     assert fallbacks == [{"gpt-3.5-turbo": ["claude-3-haiku"]}, "gpt-4o-mini"]
@@ -309,3 +311,33 @@ def test_fallback_attempt_key_is_stable_across_key_order():
     assert fallback_attempt_key({"model": "group-a", "_target_order": 2}) == fallback_attempt_key(
         {"_target_order": 2, "model": "group-a"}
     )
+
+
+@pytest.mark.parametrize(
+    "extra, expected",
+    [([], ["fb1", "fb2"]), ([{"fb1": []}], []), ([{"fb1": ["own-backup"]}], ["own-backup"])],
+)
+@pytest.mark.parametrize("generic_first", [False, True])
+def test_streaming_hop_resumes_original_chain_after_specific_lookup(extra, expected, generic_first):
+    kwargs = {"attempted_targets": request_fallback_targets({}, "primary")}
+    generic = [{"*": ["generic-backup"]}]
+    specific = [{"primary": ["fb1", "fb2"]}, *extra]
+    fallbacks = generic + specific if generic_first else specific + generic
+    assert fallback_lookup_groups(kwargs, "fb1") == ("fb1", "primary")
+    resolved, _ = get_fallback_model_group_for_lookup_groups(fallbacks, fallback_lookup_groups(kwargs, "fb1"))
+    assert resolved == expected
+
+
+def test_streaming_controls_share_tracker_without_trusting_a_caller_dict():
+    controls = {"fallbacks": [{"primary": ["backup"]}], "num_retries": 0}
+    tracker = request_fallback_targets(
+        {**controls, "attempted_targets": {"original_model_group": "injected"}}, "primary"
+    )
+    tracker.record("backup")
+    snapshot = streaming_fallback_kwargs("backup", {"attempted_targets": tracker})
+    assert snapshot["fallbacks"] is controls["fallbacks"]
+    assert snapshot["num_retries"] == 0
+    assert snapshot["attempted_targets"] is tracker
+    assert request_fallback_targets(snapshot, "backup") is tracker
+    assert fallback_lookup_groups(snapshot, "backup") == ("backup", "primary")
+    assert "backup" in tracker
