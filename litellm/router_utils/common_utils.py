@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from litellm.types.llms.openai import OpenAIFileObject
 
 from litellm._logging import verbose_logger
+from litellm.constants import ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS
 from litellm.exceptions import BadRequestError
 from litellm.types.router import CredentialLiteLLMParams
 
@@ -20,6 +21,13 @@ def _is_proxy_admin_request(request_kwargs: Mapping[str, object] | None) -> bool
     litellm_metadata = litellm_metadata_value if isinstance(litellm_metadata_value, Mapping) else {}
     user_api_key_auth = metadata.get("user_api_key_auth") or litellm_metadata.get("user_api_key_auth")
     return getattr(user_api_key_auth, "user_role", None) == "proxy_admin"
+
+
+def truncate_fallback_error_detail(detail: str) -> str:
+    if len(detail) <= ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS:
+        return detail
+    dropped = len(detail) - ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS
+    return f"{detail[:ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS]}... [truncated {dropped} characters]"
 
 
 def get_litellm_params_sensitive_credential_hash(litellm_params: dict) -> str:

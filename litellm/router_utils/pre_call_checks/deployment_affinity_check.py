@@ -304,6 +304,8 @@ class DeploymentAffinityCheck(CustomLogger):
         """
         request_kwargs = request_kwargs or {}
         typed_healthy_deployments = cast(list[dict], healthy_deployments)
+        if request_kwargs.get("_target_order") is not None:
+            return typed_healthy_deployments
 
         (
             enable_user_key,

@@ -115,6 +115,7 @@ from litellm.router_utils.common_utils import (
     _is_proxy_admin_request,
     filter_team_based_models,
     filter_web_search_deployments,
+    truncate_fallback_error_detail,
 )
 from litellm.router_utils.cooldown_cache import CooldownCache
 from litellm.router_utils.cooldown_handlers import (
@@ -6332,11 +6333,10 @@ class Router:
                 return response
         except Exception as new_exception:
             parent_otel_span = _get_parent_otel_span_from_kwargs(kwargs)
-            fallback_failure_exception_str = redact_string(str(new_exception))
+            fallback_failure_exception_str = truncate_fallback_error_detail(redact_string(str(new_exception)))
             verbose_router_logger.error(
-                "litellm.router.py::async_function_with_fallbacks() - Error occurred while trying to do fallbacks - {}\n{}\n\nDebug Information:\nCooldown Deployments={}".format(
+                "litellm.router.py::async_function_with_fallbacks() - Error occurred while trying to do fallbacks - {}\n\nDebug Information:\nCooldown Deployments={}".format(
                     fallback_failure_exception_str,
-                    redact_string(traceback.format_exc()),
                     await _async_get_cooldown_deployments_with_debug_info(
                         litellm_router_instance=self,
                         parent_otel_span=parent_otel_span,
@@ -7136,7 +7136,7 @@ class Router:
                 k,
                 v,
             ) in kwargs.items():  # log everything in kwargs except the old previous_models value - prevent nesting
-                if k not in [_metadata_var, "messages", "original_function"]:
+                if k not in [_metadata_var, "messages", "original_function", "attempted_targets"]:
                     previous_model[k] = v
                 elif k == _metadata_var and isinstance(v, dict):
                     previous_model[_metadata_var] = {}  # type: ignore

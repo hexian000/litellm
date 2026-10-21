@@ -4,12 +4,14 @@ from unittest.mock import Mock
 import pytest
 
 from litellm import Router
+from litellm.constants import ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.router_utils.common_utils import (
     _deployment_supports_web_search,
     add_model_file_id_mappings,
     filter_team_based_models,
     filter_web_search_deployments,
+    truncate_fallback_error_detail,
 )
 
 
@@ -516,3 +518,22 @@ class TestAddModelFileIdMappings:
     def test_should_return_empty_mapping_when_given_empty_list(self):
         result = add_model_file_id_mappings([], [])
         assert result == {}
+
+
+class TestTruncateFallbackErrorDetail:
+    def test_short_detail_is_returned_unchanged(self):
+        assert truncate_fallback_error_detail("boom") == "boom"
+
+    def test_detail_at_the_limit_is_returned_unchanged(self):
+        detail = "x" * ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS
+        assert truncate_fallback_error_detail(detail) == detail
+
+    def test_long_detail_is_bounded_and_reports_what_was_dropped(self):
+        detail = "x" * (ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS + 500)
+        truncated = truncate_fallback_error_detail(detail)
+        assert truncated.startswith("x" * ROUTER_FALLBACK_ERROR_DETAIL_MAX_CHARS)
+        assert truncated.endswith("... [truncated 500 characters]")
+        assert len(truncated) < len(detail)
+
+    def test_a_megabyte_of_detail_comes_back_small(self):
+        assert len(truncate_fallback_error_detail("x" * 1000000)) < 3000
