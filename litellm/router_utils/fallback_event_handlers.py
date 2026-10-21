@@ -1,5 +1,10 @@
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final
 
 import litellm
 from litellm._logging import verbose_router_logger
@@ -17,6 +22,85 @@ if TYPE_CHECKING:
     LitellmRouter = _Router
 else:
     LitellmRouter = Any
+
+
+def fallback_attempt_key(fallback_target: object) -> str | None:
+    if isinstance(fallback_target, str):
+        return fallback_target
+    if not isinstance(fallback_target, dict):
+        return None
+    model: Final = fallback_target.get("model")
+    if tuple(fallback_target) == ("model",) and isinstance(model, str):
+        return model
+    serialized: Final = json.dumps(fallback_target, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+@dataclass(slots=True)
+class AttemptedFallbackTargets:
+    keys: frozenset[str] = frozenset()
+    original_model_group: str | None = None
+    overrides: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.keys
+
+    def record(self, key: str) -> None:
+        self.keys = self.keys | frozenset((key,))
+
+
+def request_fallback_targets(kwargs: Mapping[str, object], model_group: str | None) -> AttemptedFallbackTargets:
+    carried: Final = kwargs.get("attempted_targets")
+    if isinstance(carried, AttemptedFallbackTargets):
+        return carried
+    controls: Final = (
+        "fallbacks",
+        "context_window_fallbacks",
+        "content_policy_fallbacks",
+        "num_retries",
+        "model_group_retry_policy",
+        "disable_fallbacks",
+    )
+    return AttemptedFallbackTargets(
+        original_model_group=model_group,
+        overrides=MappingProxyType({key: kwargs[key] for key in controls if key in kwargs}),
+    )
+
+
+def streaming_fallback_kwargs(model: str, kwargs: Mapping[str, object]) -> dict[str, object]:
+    carried: Final = kwargs.get("attempted_targets")
+    overrides: Final = carried.overrides if isinstance(carried, AttemptedFallbackTargets) else kwargs
+    return {**kwargs, **overrides, "model": model}
+
+
+def fallback_lookup_groups(kwargs: Mapping[str, object], model_group: str | None) -> tuple[str, ...]:
+    carried: Final = kwargs.get("attempted_targets")
+    original_group: Final = carried.original_model_group if isinstance(carried, AttemptedFallbackTargets) else None
+    return tuple(dict.fromkeys(group for group in (model_group, original_group) if group))
+
+
+def get_fallback_model_group_for_lookup_groups(
+    fallbacks: Sequence[str | Mapping[str, Sequence[str]]], lookup_groups: tuple[str, ...]
+) -> tuple[list[str] | None, int | None]:
+    results: Final = tuple(get_fallback_model_group(fallbacks, group) for group in lookup_groups)
+    specific: Final = next(
+        (result for result in results if result[0] and _resolved_specific_chain(fallbacks, result)), None
+    )
+    if specific is not None:
+        return specific
+    return next((result for result in reversed(results) if result[0] is not None), (None, None))
+
+
+def _resolved_specific_chain(
+    fallbacks: Sequence[str | Mapping[str, Sequence[str]]], result: tuple[Sequence[str] | None, int | None]
+) -> bool:
+    resolved, generic_idx = result
+    if resolved is None:
+        return False
+    if generic_idx is None:
+        return True
+    generic_entry: Final = fallbacks[generic_idx]
+    return not isinstance(generic_entry, dict) or resolved is not generic_entry.get("*")
 
 
 def _check_stripped_model_group(model_group: str, fallback_key: str) -> bool:
@@ -44,7 +128,7 @@ def _check_stripped_model_group(model_group: str, fallback_key: str) -> bool:
     return False
 
 
-def get_fallback_model_group(fallbacks: list[Any], model_group: str) -> tuple[list[str] | None, int | None]:
+def get_fallback_model_group(fallbacks: Sequence[Any], model_group: str) -> tuple[list[str] | None, int | None]:
     """
     Returns:
     - fallback_model_group: List[str] of fallback model groups. example: ["gpt-4", "gpt-3.5-turbo"]
@@ -120,14 +204,29 @@ async def run_async_fallback(
 
     error_from_fallbacks = original_exception
     fallback_errors = (get_fallback_error_info(original_exception),)
+    carried_targets: Final = kwargs.get("attempted_targets")
+    attempted: Final = (
+        carried_targets if isinstance(carried_targets, AttemptedFallbackTargets) else AttemptedFallbackTargets()
+    )
+    attempted.record(original_model_group)
 
     for mg in fallback_model_group:
         if mg == original_model_group:
             continue
+        attempt_key = fallback_attempt_key(mg)
+        if attempt_key is not None:
+            if attempt_key in attempted:
+                verbose_router_logger.info(
+                    "Skipping fallback to model_group = %s, already attempted for this request",
+                    mask_sensitive_structure(mg),
+                )
+                continue
+            attempted.record(attempt_key)
         try:
             # LOGGING
             kwargs = litellm_router.log_retry(kwargs=kwargs, e=original_exception)
             verbose_router_logger.info(f"Falling back to model_group = {mask_sensitive_structure(mg)}")
+            kwargs.pop("_target_order", None)
             if isinstance(mg, str):
                 kwargs["model"] = mg
             elif isinstance(mg, dict):
@@ -138,6 +237,7 @@ async def run_async_fallback(
             fallback_depth = fallback_depth + 1
             kwargs["fallback_depth"] = fallback_depth
             kwargs["max_fallbacks"] = max_fallbacks
+            kwargs["attempted_targets"] = attempted
             if include_fallback_errors:
                 kwargs["include_fallback_errors"] = include_fallback_errors
             response = await litellm_router.async_function_with_fallbacks(*args, **kwargs)
@@ -221,7 +321,7 @@ async def log_failure_fallback_event(original_model_group: str, kwargs: dict, or
             verbose_router_logger.error(f"Error in log_failure_fallback_event: {e!s}")
 
 
-def _check_non_standard_fallback_format(fallbacks: list[Any] | None) -> bool:
+def _check_non_standard_fallback_format(fallbacks: Sequence[Any] | None) -> bool:
     """
     Checks if the fallbacks list is a list of strings or a list of dictionaries.
 
