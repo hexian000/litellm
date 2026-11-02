@@ -48,7 +48,9 @@ def response_tool_call_names(completion_response: Any) -> tuple[str, ...]:
 
     return tuple(
         stripped
-        for tool_call in get_tool_calls_from_response(completion_response, include_all_choices=True)
+        for tool_call in get_tool_calls_from_response(
+            completion_response, include_all_choices=True, parse_arguments=False
+        )
         if isinstance(name := tool_call.get("name"), str) and (stripped := name.strip())
     )
 

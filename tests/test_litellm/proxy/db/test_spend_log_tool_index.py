@@ -6,7 +6,7 @@ LiteLLM_DailyToolSpend rollup in one transaction.
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -66,7 +66,9 @@ class TestBuildToolUsageTransaction:
                 mcp_namespaced_tool_name=None,
                 spend=0.5,
                 total_tokens=100,
-                completion_response=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None))]),
+                completion_response=SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=None))]
+                ),
             )
             is None
         )
@@ -172,6 +174,31 @@ class TestBuildToolUsageTransaction:
 
 
 class TestResponseToolCallNames:
+    @pytest.mark.parametrize("arguments", ['{"private":"value"}', "redacted-by-litellm", "not-json"])
+    @pytest.mark.parametrize("surface", ["chat", "responses"])
+    def test_tool_index_never_parses_arguments(self, arguments: str, surface: str) -> None:
+        response = (
+            {
+                "choices": [
+                    {"message": {"tool_calls": [{"id": name, "function": {"name": name, "arguments": arguments}}]}}
+                    for name in ("first_tool", "second_tool")
+                ]
+            }
+            if surface == "chat"
+            else {
+                "output": [
+                    {"type": "function_call", "call_id": name, "name": name, "arguments": arguments}
+                    for name in ("first_tool", "second_tool")
+                ]
+            }
+        )
+        with patch(
+            "litellm.litellm_core_utils.prompt_templates.common_utils.parse_tool_call_arguments",
+            side_effect=AssertionError("tool-name accounting must not parse arguments"),
+        ):
+            assert response_tool_call_names(response) == ("first_tool", "second_tool")
+        assert arguments in str(response)
+
     def test_unrecognized_shapes_yield_nothing(self):
         assert response_tool_call_names(None) == ()
         assert response_tool_call_names(SimpleNamespace()) == ()

@@ -5350,7 +5350,7 @@ def _parse_tool_call_arguments(raw: Any, tool_name: str | None, context: str) ->
     # truncated by the model, so route those through the repair-aware parser.
     if isinstance(raw, dict):
         return raw
-    if not isinstance(raw, str):
+    if not isinstance(raw, str) or raw == "redacted-by-litellm":
         return {}
     from litellm.litellm_core_utils.prompt_templates.common_utils import (
         parse_tool_call_arguments,
@@ -5365,7 +5365,7 @@ def _parse_tool_call_arguments(raw: Any, tool_name: str | None, context: str) ->
 
 
 def _tool_calls_from_chat_completion_response(
-    response: Any, include_all_choices: bool = False
+    response: Any, include_all_choices: bool = False, parse_arguments: bool = True
 ) -> list[NormalizedToolCall]:
     choices = get_attribute_or_key(response, "choices", None)
     if not (isinstance(choices, list) and choices):
@@ -5387,7 +5387,7 @@ def _tool_calls_from_chat_completion_response(
                 id=get_attribute_or_key(tc, "id"),
                 name=name,
                 arguments=_parse_tool_call_arguments(
-                    get_attribute_or_key(fn, "arguments", "{}"),
+                    get_attribute_or_key(fn, "arguments", "{}") if parse_arguments else None,
                     tool_name=name,
                     context="chat completions",
                 ),
@@ -5396,7 +5396,7 @@ def _tool_calls_from_chat_completion_response(
     return result
 
 
-def _tool_calls_from_responses_api_response(response: Any) -> list[NormalizedToolCall]:
+def _tool_calls_from_responses_api_response(response: Any, parse_arguments: bool = True) -> list[NormalizedToolCall]:
     output = get_attribute_or_key(response, "output", None)
     if not isinstance(output, list):
         return []
@@ -5410,7 +5410,7 @@ def _tool_calls_from_responses_api_response(response: Any) -> list[NormalizedToo
                 id=get_attribute_or_key(item, "call_id") or get_attribute_or_key(item, "id"),
                 name=name,
                 arguments=_parse_tool_call_arguments(
-                    get_attribute_or_key(item, "arguments", "{}"),
+                    get_attribute_or_key(item, "arguments", "{}") if parse_arguments else None,
                     tool_name=name,
                     context="responses API",
                 ),
@@ -5419,7 +5419,9 @@ def _tool_calls_from_responses_api_response(response: Any) -> list[NormalizedToo
     return result
 
 
-def _tool_calls_from_anthropic_messages_response(response: Any) -> list[NormalizedToolCall]:
+def _tool_calls_from_anthropic_messages_response(
+    response: Any, parse_arguments: bool = True
+) -> list[NormalizedToolCall]:
     content = get_attribute_or_key(response, "content", None)
     if not isinstance(content, list):
         return []
@@ -5432,13 +5434,15 @@ def _tool_calls_from_anthropic_messages_response(response: Any) -> list[Normaliz
             NormalizedToolCall(
                 id=get_attribute_or_key(block, "id"),
                 name=get_attribute_or_key(block, "name"),
-                arguments=raw_input if isinstance(raw_input, dict) else {},
+                arguments=raw_input if parse_arguments and isinstance(raw_input, dict) else {},
             )
         )
     return result
 
 
-def get_tool_calls_from_response(response: Any, include_all_choices: bool = False) -> list[NormalizedToolCall]:
+def get_tool_calls_from_response(
+    response: Any, include_all_choices: bool = False, *, parse_arguments: bool = True
+) -> list[NormalizedToolCall]:
     """
     Extract tool/function calls from a response object into a normalized
     ``{"id", "name", "arguments"}`` shape, regardless of which API surface
@@ -5456,14 +5460,16 @@ def get_tool_calls_from_response(response: Any, include_all_choices: bool = Fals
     Callers that only care about a specific tool should filter the result by
     ``name`` themselves -- this returns every tool call found.
     """
-    chat_tool_calls = _tool_calls_from_chat_completion_response(response, include_all_choices=include_all_choices)
+    chat_tool_calls = _tool_calls_from_chat_completion_response(
+        response, include_all_choices=include_all_choices, parse_arguments=parse_arguments
+    )
     if chat_tool_calls:
         return chat_tool_calls
     for extractor in (
         _tool_calls_from_responses_api_response,
         _tool_calls_from_anthropic_messages_response,
     ):
-        tool_calls = extractor(response)
+        tool_calls = extractor(response, parse_arguments=parse_arguments)
         if tool_calls:
             return tool_calls
     return []
