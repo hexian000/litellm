@@ -3182,6 +3182,31 @@ def _n_choices_response(*names_per_choice):
     return SimpleNamespace(choices=choices)
 
 
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize(
+    ("arguments", "expected", "warns"),
+    [("redacted-by-litellm", {}, False), ('{"city":"Paris"}', {"city": "Paris"}, False), ("not-json", {}, True)],
+)
+def test_tool_arguments_preserve_redaction_and_real_diagnostics(
+    surface: str, arguments: str, expected: dict[str, str], warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import get_tool_calls_from_response
+
+    response = (
+        {
+            "choices": [
+                {"message": {"tool_calls": [{"id": "c1", "function": {"name": "weather", "arguments": arguments}}]}}
+            ]
+        }
+        if surface == "chat"
+        else {"output": [{"type": "function_call", "call_id": "c1", "name": "weather", "arguments": arguments}]}
+    )
+    with caplog.at_level("WARNING", logger="LiteLLM"):
+        assert get_tool_calls_from_response(response) == [{"id": "c1", "name": "weather", "arguments": expected}]
+    assert ("Failed to parse tool call arguments" in caplog.text) is warns
+    assert arguments in str(response)
+
+
 def test_get_tool_calls_from_response_defaults_to_primary_choice_only():
     from litellm.litellm_core_utils.prompt_templates.factory import get_tool_calls_from_response
 
