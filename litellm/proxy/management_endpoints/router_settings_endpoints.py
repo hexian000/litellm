@@ -8,14 +8,15 @@ GET /router/fields - Get router settings field definitions without values (for U
 """
 
 import inspect
-from typing import Any, get_args
+from typing import Annotated, Any, get_args
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from litellm._logging import verbose_proxy_logger
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.management_endpoints.router_runtime_state import RouterRuntimeState, snapshot_runtime
 from litellm.router import Router
 from litellm.types.management_endpoints import (
     ROUTER_SETTINGS_FIELDS,
@@ -170,3 +171,20 @@ async def get_router_fields(
     except Exception as e:
         verbose_proxy_logger.error(f"Error fetching router fields: {e!s}")
         raise
+
+
+@router.get(
+    "/router/runtime-state",
+    response_model=RouterRuntimeState,
+)
+async def get_router_runtime_state(
+    model_id: Annotated[tuple[str, ...], Query(min_length=1, max_length=100)],
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+) -> RouterRuntimeState:
+    from litellm.proxy.proxy_server import llm_router
+
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=403, detail="Runtime inspection requires a proxy admin")
+    if llm_router is None:
+        raise HTTPException(status_code=503, detail="Router is not initialized")
+    return snapshot_runtime(llm_router, tuple(model_id))
