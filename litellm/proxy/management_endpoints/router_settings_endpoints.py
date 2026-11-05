@@ -16,7 +16,12 @@ from pydantic import BaseModel, Field
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
-from litellm.proxy.management_endpoints.router_runtime_state import RouterRuntimeState, snapshot_runtime
+from litellm.proxy.management_endpoints.router_runtime_state import (
+    RouterRuntimeRoutingState,
+    RouterRuntimeState,
+    snapshot_routing,
+    snapshot_runtime,
+)
 from litellm.router import Router
 from litellm.types.management_endpoints import (
     ROUTER_SETTINGS_FIELDS,
@@ -188,3 +193,16 @@ async def get_router_runtime_state(
     if llm_router is None:
         raise HTTPException(status_code=503, detail="Router is not initialized")
     return snapshot_runtime(llm_router, tuple(model_id))
+
+
+@router.get("/router/runtime-state/routing", response_model=RouterRuntimeRoutingState)
+async def get_router_runtime_routing_state(
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+) -> RouterRuntimeRoutingState:
+    from litellm.proxy.proxy_server import llm_router
+
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=403, detail="Runtime inspection requires a proxy admin")
+    if llm_router is None:
+        raise HTTPException(status_code=503, detail="Router is not initialized")
+    return snapshot_routing(llm_router)

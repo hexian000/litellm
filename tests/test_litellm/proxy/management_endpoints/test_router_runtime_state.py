@@ -194,3 +194,158 @@ def test_snapshot_refuses_inconsistent_serving_identity():
     with pytest.raises(HTTPException) as error:
         router_runtime_state.snapshot_runtime(serving, ("selected",))
     assert error.value.status_code == 503
+
+
+def test_routing_http_exposes_masked_live_graph_and_all_execution_parameters():
+    from litellm.utils import get_optional_params
+
+    serving = Router(
+        model_list=[
+            {
+                "model_name": "bounded",
+                "model_info": {"id": "selected"},
+                "litellm_params": {"model": "deepseek/deepseek-chat"},
+            },
+            {
+                "model_name": "hidden",
+                "model_info": {"id": "hidden-id"},
+                "litellm_params": {
+                    "model": "deepseek/deepseek-chat",
+                    "api_key": "private-credential",
+                    "additional_drop_params": ["max_tokens"],
+                },
+            },
+        ],
+        fallbacks=[{"bounded": ["hidden"]}],
+        context_window_fallbacks=[{"bounded": ["hidden"]}],
+        content_policy_fallbacks=[{"bounded": ["hidden"]}],
+        default_fallbacks=["hidden"],
+        model_group_alias={"masked-alias": {"model": "hidden", "hidden": True}, "selected": "hidden"},
+    )
+    config = AsyncMock(return_value={"router_settings": {"fallbacks": [], "model_group_alias": {}}})
+    with (
+        patch.object(proxy_server, "llm_router", serving),
+        patch.object(proxy_server.proxy_config, "get_config", config),
+    ):
+        client = runtime_client(serving)
+        legacy = client.get("/router/settings").json()
+        selected = client.get("/router/runtime-state", params={"model_id": "selected"}).json()
+        response = client.get("/router/runtime-state/routing")
+    assert legacy["current_values"]["fallbacks"] == []
+    assert legacy["current_values"]["model_group_alias"] == {}
+    assert len(selected["deployments"]) == 1
+    assert response.status_code == 200
+    body = response.json()
+    assert body["protocol"] == "litellm.runtime-routing-state/v1"
+    assert body["runtime"]["boot_id"] == selected["boot_id"]
+    assert body["runtime"]["protocol_source_sha256"] == selected["protocol_source_sha256"]
+    assert body["model_name_to_deployment_indices"] == {"bounded": [0], "hidden": [1]}
+    sources = body["routing_sources"]["values"]
+    assert sources["fallbacks"] == [{"bounded": ["hidden"]}, {"*": ["hidden"]}]
+    assert sources["context_window_fallbacks"] == [{"bounded": ["hidden"]}]
+    assert sources["content_policy_fallbacks"] == [{"bounded": ["hidden"]}]
+    assert sources["model_group_alias"]["masked-alias"] == {"model": "hidden", "hidden": True}
+    assert body["default_fallbacks_source"] == "fallbacks[*]"
+    assert body["selection_semantics"] == "router-selection/v1"
+    hidden = body["runtime"]["deployments"][1]
+    assert hidden["model_id"] == "hidden-id"
+    assert hidden["litellm_params"]["values"]["additional_drop_params"] == ["max_tokens"]
+    assert "private-credential" not in response.text
+    assert "max_tokens" not in get_optional_params(
+        model="deepseek-chat",
+        custom_llm_provider="deepseek",
+        max_tokens=65536,
+        additional_drop_params=hidden["litellm_params"]["values"]["additional_drop_params"],
+    )
+    _, explicit = serving._common_checks_available_deployment("selected")
+    _, alias = serving._common_checks_available_deployment("masked-alias")
+    assert explicit["model_info"]["id"] == "selected"
+    assert [entry["model_info"]["id"] for entry in alias] == ["hidden-id"]
+
+
+@pytest.mark.parametrize("role", [LitellmUserRoles.INTERNAL_USER, LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY])
+def test_routing_http_refuses_non_admin(role):
+    with patch.object(proxy_server, "llm_router", runtime_router()):
+        response = runtime_client(None, role).get("/router/runtime-state/routing")
+    assert response.status_code == 403
+
+
+def test_routing_http_refuses_uninitialized_router():
+    with patch.object(proxy_server, "llm_router", None):
+        response = runtime_client(None).get("/router/runtime-state/routing")
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "source", ["fallbacks", "context_window_fallbacks", "content_policy_fallbacks", "model_group_alias"]
+)
+def test_routing_http_refuses_uninspectable_values_without_disclosure(source):
+    serving = runtime_router()
+    setattr(serving, source, {"private-key": object()})
+    with patch.object(proxy_server, "llm_router", serving):
+        response = runtime_client(serving).get("/router/runtime-state/routing")
+    assert response.status_code == 503
+    assert "private" not in response.text
+
+
+def test_routing_snapshot_refuses_incomplete_inventory():
+    from fastapi import HTTPException
+
+    serving = runtime_router()
+    del serving.model_id_to_deployment_index_map["unrelated"]
+    with pytest.raises(HTTPException) as error:
+        router_runtime_state.snapshot_routing(serving)
+    assert error.value.status_code == 503
+
+
+def test_routing_snapshot_marks_wildcard_extensions_opaque():
+    serving = Router(
+        model_list=[
+            {
+                "model_name": "*",
+                "model_info": {"id": "wildcard"},
+                "litellm_params": {"model": "openai/*", "api_key": "private-credential"},
+            },
+        ]
+    )
+    state = router_runtime_state.snapshot_routing(serving)
+    assert "pattern_router" in state.opaque_sources
+    assert "provider_default_deployment_ids" in state.opaque_sources
+    assert "private-credential" not in state.model_dump_json()
+
+
+def test_routing_snapshot_observes_sdk_alias_map_and_null_fallback_sources():
+    serving = runtime_router()
+    serving.fallbacks = None
+    with patch.dict("litellm.model_alias_map", {"sdk-alias": "hidden"}, clear=True):
+        state = router_runtime_state.snapshot_routing(serving)
+    assert state.routing_sources.values["model_alias_map"] == {"sdk-alias": "hidden"}
+    assert state.routing_sources.values["fallbacks"] is None
+
+
+def test_routing_snapshot_marks_installed_custom_selector_opaque():
+    from litellm.types.router import CustomRoutingStrategyBase
+
+    serving = runtime_router()
+    serving.set_custom_routing_strategy(CustomRoutingStrategyBase())
+    state = router_runtime_state.snapshot_routing(serving)
+    assert "instance_method_overrides" in state.opaque_sources
+
+
+def test_routing_snapshot_marks_callbacks_opaque_without_serializing_them():
+    serving = runtime_router()
+    with patch.object(router_runtime_state.litellm, "callbacks", ["private-callback-configuration"]):
+        state = router_runtime_state.snapshot_routing(serving)
+    assert "callbacks" in state.opaque_sources
+    assert "private-callback-configuration" not in state.model_dump_json()
+
+
+def test_routing_http_refuses_typed_sdk_alias_without_disclosing_values():
+    serving = runtime_router()
+    with (
+        patch.object(proxy_server, "llm_router", serving),
+        patch.dict("litellm.model_alias_map", {"sdk-alias": {"model": "private-value", "hidden": True}}, clear=True),
+    ):
+        response = runtime_client(serving).get("/router/runtime-state/routing")
+    assert response.status_code == 503
+    assert "private-value" not in response.text

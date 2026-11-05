@@ -11440,6 +11440,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/router/runtime-state/routing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Router Runtime Routing State */
+        get: operations["get_router_runtime_routing_state_router_runtime_state_routing_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/router/settings": {
         parameters: {
             query?: never;
@@ -30846,6 +30863,37 @@ export interface components {
                 [key: string]: string;
             };
         };
+        /** RouterRuntimeRoutingState */
+        RouterRuntimeRoutingState: {
+            /**
+             * Default Fallbacks Source
+             * @default fallbacks[*]
+             * @constant
+             */
+            default_fallbacks_source: "fallbacks[*]";
+            /** Model Name To Deployment Indices */
+            model_name_to_deployment_indices: {
+                [key: string]: number[];
+            };
+            /** Model Names */
+            model_names: string[];
+            /** Opaque Sources */
+            opaque_sources: string[];
+            /**
+             * Protocol
+             * @default litellm.runtime-routing-state/v1
+             * @constant
+             */
+            protocol: "litellm.runtime-routing-state/v1";
+            routing_sources: components["schemas"]["RuntimeParameters"];
+            runtime: components["schemas"]["RouterRuntimeState"];
+            /**
+             * Selection Semantics
+             * @default router-selection/v1
+             * @constant
+             */
+            selection_semantics: "router-selection/v1";
+        };
         /** RouterRuntimeState */
         RouterRuntimeState: {
             /** Boot Id */
@@ -48563,6 +48611,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_router_runtime_routing_state_router_runtime_state_routing_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RouterRuntimeRoutingState"];
                 };
             };
         };
