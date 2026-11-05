@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, StrictInt, TypeAdapter, ValidationError
 
 import litellm
 from litellm._version import version
@@ -61,8 +61,8 @@ class RuntimeRoutingIndices(BaseModel):
 
     model_list: tuple[object, ...]
     model_names: frozenset[str]
-    model_id_to_deployment_index_map: Mapping[str, int]
-    model_name_to_deployment_indices: Mapping[str, tuple[int, ...]]
+    model_id_to_deployment_index_map: Mapping[str, StrictInt]
+    model_name_to_deployment_indices: Mapping[str, tuple[StrictInt, ...]]
 
 
 class RuntimeParameters(BaseModel):

@@ -41,11 +41,11 @@ def runtime_router():
     )
 
 
-def runtime_client(serving_router, role=LitellmUserRoles.PROXY_ADMIN):
+def runtime_client(serving_router, role=LitellmUserRoles.PROXY_ADMIN, *, raise_server_exceptions=True):
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(user_role=role)
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def test_runtime_http_preserves_effective_defaults_and_retained_keyspace():
@@ -349,3 +349,17 @@ def test_routing_http_refuses_typed_sdk_alias_without_disclosing_values():
         response = runtime_client(serving).get("/router/runtime-state/routing")
     assert response.status_code == 503
     assert "private-value" not in response.text
+
+
+@pytest.mark.parametrize("source", ["model_id_to_deployment_index_map", "model_name_to_deployment_indices"])
+@pytest.mark.parametrize("index", ["0", 0.0, False])
+def test_routing_http_refuses_coercible_inventory_indices(source, index):
+    serving = runtime_router()
+    if source == "model_id_to_deployment_index_map":
+        serving.model_id_to_deployment_index_map["selected"] = index
+    else:
+        serving.model_name_to_deployment_indices["bounded"] = [index]
+    with patch.object(proxy_server, "llm_router", serving):
+        response = runtime_client(serving, raise_server_exceptions=False).get("/router/runtime-state/routing")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Serving inventory is not inspectable"}
