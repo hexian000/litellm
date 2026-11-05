@@ -444,7 +444,11 @@ async def test_inference_inspection_refuses_unsupported_cached_extensions_withou
 @pytest.mark.skipif(
     not os.environ.get("LITELLM_INSPECTION_TEST_DATABASE_URL"), reason="requires an isolated PostgreSQL schema"
 )
-async def test_real_postgres_generated_team_key_inspection_and_retained_process_authentication(serving):
+@pytest.mark.parametrize("cancellation_phase", ["authentication", "release"])
+@pytest.mark.parametrize("cancel_count", [1, 2])
+async def test_real_postgres_generated_team_key_inspection_and_retained_process_authentication(
+    serving, cancellation_phase, cancel_count
+):
     database_url = os.environ["LITELLM_INSPECTION_TEST_DATABASE_URL"]
     assert "127.0.0.1" in database_url and "/inspection" in database_url
     with patch.dict(os.environ, {"DATABASE_URL": database_url}):
@@ -524,16 +528,28 @@ async def test_real_postgres_generated_team_key_inspection_and_retained_process_
                     async def gated_authentication(**kwargs):
                         resolved = await original_authentication(**kwargs)
                         captured_auth.append(resolved)
-                        authenticated.set()
-                        await allow_return.wait()
+                        if cancellation_phase == "authentication":
+                            authenticated.set()
+                            await allow_return.wait()
                         return resolved
 
-                    with patch.object(inference_protocol, "user_api_key_auth", gated_authentication):
+                    async def gated_release(reservation):
+                        if cancellation_phase == "release":
+                            authenticated.set()
+                            await allow_return.wait()
+                        await release_budget_reservation(reservation)
+
+                    with (
+                        patch.object(inference_protocol, "user_api_key_auth", gated_authentication),
+                        patch.object(inference_protocol, "release_budget_reservation", gated_release),
+                    ):
                         cancelled = asyncio.create_task(
                             client.post("/router/runtime-state/preprocessing", headers=headers, json=envelope)
                         )
                         await asyncio.wait_for(authenticated.wait(), timeout=10)
-                        cancelled.cancel()
+                        for _ in range(cancel_count):
+                            cancelled.cancel()
+                            await asyncio.sleep(0)
                         allow_return.set()
                         with pytest.raises(asyncio.CancelledError):
                             await cancelled

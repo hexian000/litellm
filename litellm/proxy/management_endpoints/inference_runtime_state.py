@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, TypeVar
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, StrictStr, TypeAdapter, ValidationError
@@ -61,6 +61,7 @@ AUTHENTICATION_EXTENSIONS = (
 AUTHENTICATION_HEADERS = frozenset(
     ("authorization", "x-litellm-api-key", "x-api-key", "api-key", "x-goog-api-key", "x-litellm-inspection-credential")
 )
+INSPECTION_TASK_RESULT = TypeVar("INSPECTION_TASK_RESULT")
 
 
 class InferenceInspectionRequest(BaseModel):
@@ -211,6 +212,16 @@ def resolved_authentication(
         raise HTTPException(status_code=503, detail="Authentication context is not inspectable") from None
 
 
+async def finish_inspection_task(task: asyncio.Task[INSPECTION_TASK_RESULT]) -> INSPECTION_TASK_RESULT:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+    return task.result()
+
+
 async def inspect_inference_preprocessing(
     envelope: InferenceInspectionRequest, credential: str, original: Request
 ) -> InferenceRuntimePreprocessingState:
@@ -249,10 +260,12 @@ async def inspect_inference_preprocessing(
         authentication = await asyncio.shield(authentication_task)
     except asyncio.CancelledError as cancellation:
         try:
-            cancelled_authentication = await authentication_task
+            cancelled_authentication = await finish_inspection_task(authentication_task)
         except (HTTPException, ProxyException):
             raise cancellation from None
-        await release_budget_reservation(cancelled_authentication.budget_reservation)
+        await finish_inspection_task(
+            asyncio.create_task(release_budget_reservation(cancelled_authentication.budget_reservation))
+        )
         raise
     except (HTTPException, ProxyException):
         raise HTTPException(
@@ -296,5 +309,5 @@ async def inspect_inference_preprocessing(
         try:
             await asyncio.shield(release)
         except asyncio.CancelledError:
-            await release
+            await finish_inspection_task(release)
             raise
