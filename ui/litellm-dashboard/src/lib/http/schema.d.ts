@@ -11440,6 +11440,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/router/runtime-state/preprocessing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Proxy Runtime Preprocessing State */
+        get: operations["get_proxy_runtime_preprocessing_state_router_runtime_state_preprocessing_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/router/runtime-state/routing": {
         parameters: {
             query?: never;
@@ -30467,6 +30484,51 @@ export interface components {
              */
             user: string | null;
         };
+        /** ProxyDispatchInputs */
+        ProxyDispatchInputs: {
+            /** Deployment Names */
+            deployment_names: string[];
+            /** Pass Through All Models */
+            pass_through_all_models: boolean;
+            /** Team Public Model Names */
+            team_public_model_names: string[];
+        };
+        /** ProxyRuntimePreprocessingState */
+        ProxyRuntimePreprocessingState: {
+            /**
+             * Acceptance Semantics
+             * @default refuse-unreviewed-sources/v1
+             * @constant
+             */
+            acceptance_semantics: "refuse-unreviewed-sources/v1";
+            /** Agentic Cli Drop Params Configured */
+            agentic_cli_drop_params_configured: boolean;
+            authentication: components["schemas"]["RuntimeAuthentication"];
+            dispatch_inputs: components["schemas"]["ProxyDispatchInputs"];
+            general_settings: components["schemas"]["RuntimeParameters"];
+            /** Opaque Sources */
+            opaque_sources: string[];
+            /**
+             * Protocol
+             * @default litellm.runtime-preprocessing-state/v1
+             * @constant
+             */
+            protocol: "litellm.runtime-preprocessing-state/v1";
+            /** Protocol Source Sha256 */
+            protocol_source_sha256: string;
+            proxy_inputs: components["schemas"]["RuntimeParameters"];
+            /**
+             * Request Sources
+             * @default [
+             *       "body",
+             *       "headers",
+             *       "query",
+             *       "route"
+             *     ]
+             */
+            request_sources: ("body" | "headers" | "query" | "route")[];
+            routing: components["schemas"]["RouterRuntimeRoutingState"];
+        };
         /** PublicModelHubInfo */
         PublicModelHubInfo: {
             /** Custom Docs Description */
@@ -31051,6 +31113,22 @@ export interface components {
             object: string | null;
             /** Run Id */
             run_id: string;
+        };
+        /** RuntimeAuthentication */
+        RuntimeAuthentication: {
+            /** Aliases */
+            aliases: {
+                [key: string]: string;
+            } | null;
+            /** Credential Fingerprint */
+            credential_fingerprint: string;
+            router_settings: components["schemas"]["RuntimeParameters"];
+            /**
+             * Scope Semantics
+             * @default same-credential-no-team-or-project/v1
+             * @constant
+             */
+            scope_semantics: "same-credential-no-team-or-project/v1";
         };
         /** RuntimeDeployment */
         RuntimeDeployment: {
@@ -48611,6 +48689,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_proxy_runtime_preprocessing_state_router_runtime_state_preprocessing_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProxyRuntimePreprocessingState"];
                 };
             };
         };

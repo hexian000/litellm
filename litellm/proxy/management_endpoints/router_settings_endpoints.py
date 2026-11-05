@@ -10,12 +10,16 @@ GET /router/fields - Get router settings field definitions without values (for U
 import inspect
 from typing import Annotated, Any, get_args
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.management_endpoints.proxy_runtime_state import (
+    ProxyRuntimePreprocessingState,
+    snapshot_preprocessing,
+)
 from litellm.proxy.management_endpoints.router_runtime_state import (
     RouterRuntimeRoutingState,
     RouterRuntimeState,
@@ -206,3 +210,41 @@ async def get_router_runtime_routing_state(
     if llm_router is None:
         raise HTTPException(status_code=503, detail="Router is not initialized")
     return snapshot_routing(llm_router)
+
+
+@router.get("/router/runtime-state/preprocessing", response_model=ProxyRuntimePreprocessingState)
+async def get_proxy_runtime_preprocessing_state(
+    request: Request,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+) -> ProxyRuntimePreprocessingState:
+    from litellm.proxy import proxy_server
+
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=403, detail="Runtime inspection requires a proxy admin")
+    if proxy_server.llm_router is None:
+        raise HTTPException(status_code=503, detail="Router is not initialized")
+    if (
+        type(proxy_server.proxy_config) is not proxy_server.ProxyConfig
+        or type(proxy_server.proxy_logging_obj) is not proxy_server.ProxyLogging
+    ):
+        raise HTTPException(status_code=503, detail="Custom proxy preprocessing implementation is not inspectable")
+    if any(
+        name in vars(instance)
+        for instance in (proxy_server.proxy_config, proxy_server.proxy_logging_obj)
+        for name, value in vars(type(instance)).items()
+        if inspect.isfunction(value) or isinstance(value, (staticmethod, classmethod))
+    ):
+        raise HTTPException(status_code=503, detail="Custom proxy preprocessing implementation is not inspectable")
+    credential_headers = ("authorization", "x-litellm-api-key", "x-api-key")
+    if proxy_server.general_settings.get("litellm_key_header_name"):
+        raise HTTPException(status_code=503, detail="Custom authentication header is not inspectable")
+    credentials = tuple(tuple(request.headers.getlist(name)) for name in credential_headers)
+    if sum(len(values) for values in credentials) != 1:
+        raise HTTPException(status_code=503, detail="Authentication credential is not inspectable")
+    return snapshot_preprocessing(
+        router=proxy_server.llm_router,
+        proxy_attributes=vars(proxy_server),
+        config_attributes=vars(proxy_server.proxy_config),
+        authentication=user_api_key_dict,
+        credential=credentials,
+    )
