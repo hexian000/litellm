@@ -11423,6 +11423,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/router/runtime-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Router Runtime State */
+        get: operations["get_router_runtime_state_router_runtime_state_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/router/settings": {
         parameters: {
             query?: never;
@@ -24855,6 +24872,7 @@ export interface components {
             /** Updated By */
             updated_by?: string | null;
         };
+        JsonValue: unknown;
         /** KeyHealthResponse */
         KeyHealthResponse: {
             /**
@@ -30828,6 +30846,35 @@ export interface components {
                 [key: string]: string;
             };
         };
+        /** RouterRuntimeState */
+        RouterRuntimeState: {
+            /** Boot Id */
+            boot_id: string;
+            default_litellm_params: components["schemas"]["RuntimeParameters"];
+            /** Deployments */
+            deployments: components["schemas"]["RuntimeDeployment"][];
+            /** Hostname */
+            hostname: string;
+            /** Process Id */
+            process_id: number;
+            /**
+             * Protocol
+             * @default litellm.runtime-state/v1
+             * @constant
+             */
+            protocol: "litellm.runtime-state/v1";
+            /** Protocol Source Sha256 */
+            protocol_source_sha256: string;
+            /**
+             * Removal Semantics
+             * @default reload-or-recreate/v1
+             * @constant
+             */
+            removal_semantics: "reload-or-recreate/v1";
+            sdk_settings: components["schemas"]["RuntimeParameters"];
+            /** Version */
+            version: string;
+        };
         /** RouterSettingsField */
         RouterSettingsField: {
             /** Field Default */
@@ -30956,6 +31003,25 @@ export interface components {
             object: string | null;
             /** Run Id */
             run_id: string;
+        };
+        /** RuntimeDeployment */
+        RuntimeDeployment: {
+            litellm_params: components["schemas"]["RuntimeParameters"];
+            /** Model Id */
+            model_id: string;
+            /** Model Name */
+            model_name: string;
+        };
+        /** RuntimeParameters */
+        RuntimeParameters: {
+            /** Keys */
+            keys: string[];
+            /** Opaque Keys */
+            opaque_keys: string[];
+            /** Values */
+            values: {
+                [key: string]: components["schemas"]["JsonValue"];
+            };
         };
         /** SCIMFeature */
         SCIMFeature: {
@@ -48466,6 +48532,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RouterFieldsResponse"];
+                };
+            };
+        };
+    };
+    get_router_runtime_state_router_runtime_state_get: {
+        parameters: {
+            query: {
+                model_id: string[];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RouterRuntimeState"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
