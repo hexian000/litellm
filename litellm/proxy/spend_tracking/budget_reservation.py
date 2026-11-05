@@ -270,7 +270,7 @@ async def reconcile_budget_reservation(
         budget_reservation["finalized"] = True
 
 
-async def release_budget_reservation(budget_reservation: dict | None) -> None:
+async def release_budget_reservation(budget_reservation: dict[str, object] | None) -> None:
     await reconcile_budget_reservation(
         budget_reservation=budget_reservation,
         actual_cost=0.0,
