@@ -5642,7 +5642,7 @@ class ProxyConfig:
         )
 
     @staticmethod
-    def _parse_router_settings_value(value: Any) -> dict | None:
+    def _parse_router_settings_value(value: Any) -> dict[str, object] | None:
         """
         Parse a router_settings value that may be a dict or a JSON/YAML string.
 
@@ -5669,12 +5669,24 @@ class ProxyConfig:
             return parsed
         return None
 
+    async def get_hierarchical_router_settings(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        prisma_client: PrismaClient | None,
+        proxy_logging_obj: ProxyLogging,
+    ) -> Mapping[str, object] | None:
+        return await self._get_hierarchical_router_settings(
+            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
     async def _get_hierarchical_router_settings(
         self,
         user_api_key_dict: Optional["UserAPIKeyAuth"],
         prisma_client: PrismaClient | None,
         proxy_logging_obj: Optional["ProxyLogging"] = None,
-    ) -> dict | None:
+    ) -> dict[str, object] | None:
         """
         Get router_settings in priority order: Key > Team
 

@@ -10,12 +10,17 @@ GET /router/fields - Get router settings field definitions without values (for U
 import inspect
 from typing import Annotated, Any, get_args
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.management_endpoints.inference_runtime_state import (
+    InferenceInspectionRequest,
+    InferenceRuntimePreprocessingState,
+    inspect_inference_preprocessing,
+)
 from litellm.proxy.management_endpoints.proxy_runtime_state import (
     ProxyRuntimePreprocessingState,
     snapshot_preprocessing,
@@ -34,6 +39,22 @@ from litellm.types.management_endpoints import (
 )
 
 router = APIRouter()
+
+
+@router.post("/router/runtime-state/preprocessing", response_model=InferenceRuntimePreprocessingState)
+async def get_inference_runtime_preprocessing_state(
+    data: InferenceInspectionRequest,
+    request: Request,
+    response: Response,
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+    x_litellm_inspection_credential: Annotated[str | None, Header()] = None,
+) -> InferenceRuntimePreprocessingState:
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(status_code=403, detail="Runtime inspection requires a proxy admin")
+    if x_litellm_inspection_credential is None or len(request.headers.getlist("x-litellm-inspection-credential")) != 1:
+        raise HTTPException(status_code=400, detail="Inspection requires one original virtual-key bearer")
+    response.headers["Cache-Control"] = "no-store"
+    return await inspect_inference_preprocessing(data, x_litellm_inspection_credential, request)
 
 
 class RouterSettingsResponse(BaseModel):

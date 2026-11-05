@@ -11450,7 +11450,8 @@ export interface paths {
         /** Get Proxy Runtime Preprocessing State */
         get: operations["get_proxy_runtime_preprocessing_state_router_runtime_state_preprocessing_get"];
         put?: never;
-        post?: never;
+        /** Get Inference Runtime Preprocessing State */
+        post: operations["get_inference_runtime_preprocessing_state_router_runtime_state_preprocessing_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -24799,6 +24800,68 @@ export interface components {
             index_name: string;
             litellm_params: components["schemas"]["IndexCreateLiteLLMParams"];
         };
+        /** InferenceInspectionRequest */
+        InferenceInspectionRequest: {
+            /** Body */
+            body: string;
+            /**
+             * Headers
+             * @default []
+             */
+            headers: [
+                string,
+                string
+            ][];
+            /**
+             * Path
+             * @enum {string}
+             */
+            path: "/chat/completions" | "/v1/chat/completions" | "/responses" | "/v1/responses" | "/v1/messages";
+            /**
+             * Query
+             * @default
+             */
+            query: string;
+        };
+        /** InferenceRuntimePreprocessingState */
+        InferenceRuntimePreprocessingState: {
+            /**
+             * Acceptance Semantics
+             * @default refuse-unreviewed-sources/v1
+             * @constant
+             */
+            acceptance_semantics: "refuse-unreviewed-sources/v1";
+            /** Agentic Cli Drop Params Configured */
+            agentic_cli_drop_params_configured: boolean;
+            authenticated_request: components["schemas"]["RuntimeParameters"];
+            authentication: components["schemas"]["RuntimeInferenceAuthentication"];
+            dispatch_inputs: components["schemas"]["ProxyDispatchInputs"];
+            general_settings: components["schemas"]["RuntimeParameters"];
+            /** Inference Source Sha256 */
+            inference_source_sha256: string;
+            /** Opaque Sources */
+            opaque_sources: string[];
+            /**
+             * Protocol
+             * @default litellm.runtime-inference-preprocessing-state/v1
+             * @constant
+             */
+            protocol: "litellm.runtime-inference-preprocessing-state/v1";
+            /** Protocol Source Sha256 */
+            protocol_source_sha256: string;
+            proxy_inputs: components["schemas"]["RuntimeParameters"];
+            /**
+             * Request Sources
+             * @default [
+             *       "body",
+             *       "headers",
+             *       "query",
+             *       "route"
+             *     ]
+             */
+            request_sources: ("body" | "headers" | "query" | "route")[];
+            routing: components["schemas"]["RouterRuntimeRoutingState"];
+        };
         /** InputAudio */
         InputAudio: {
             /** Data */
@@ -31137,6 +31200,37 @@ export interface components {
             model_id: string;
             /** Model Name */
             model_name: string;
+        };
+        /** RuntimeInferenceAuthentication */
+        RuntimeInferenceAuthentication: {
+            /** Aliases */
+            aliases: {
+                [key: string]: string;
+            } | null;
+            /** Credential Fingerprint */
+            credential_fingerprint: string;
+            effective_router_settings: components["schemas"]["RuntimeParameters"];
+            key_router_settings: components["schemas"]["RuntimeParameters"];
+            /** Metadata */
+            metadata: {
+                [key: string]: components["schemas"]["RuntimeParameters"];
+            };
+            /** Request Fingerprint */
+            request_fingerprint: string;
+            /**
+             * Scope Semantics
+             * @default resolved-inference-credential/v1
+             * @constant
+             */
+            scope_semantics: "resolved-inference-credential/v1";
+            /** Scopes */
+            scopes: {
+                [key: string]: string | null;
+            };
+            /** Team Model Aliases */
+            team_model_aliases: {
+                [key: string]: string;
+            } | null;
         };
         /** RuntimeParameters */
         RuntimeParameters: {
@@ -48709,6 +48803,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProxyRuntimePreprocessingState"];
+                };
+            };
+        };
+    };
+    get_inference_runtime_preprocessing_state_router_runtime_state_preprocessing_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-litellm-inspection-credential"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceInspectionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceRuntimePreprocessingState"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
