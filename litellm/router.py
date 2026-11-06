@@ -316,7 +316,7 @@ class RoutingArgs(enum.Enum):
 
 
 class Router:
-    model_names: set = set()
+    model_names: set[str]
     cache_responses: bool | None = False
     default_cache_time_seconds: int = 1 * 60 * 60  # 1 hour
     tenacity = None
@@ -551,6 +551,7 @@ class Router:
 
         # Initialize model ID to deployment index mapping for O(1) lookups
         self.model_id_to_deployment_index_map: dict[str, int] = {}
+        self.model_names = set()
         # Initialize model name to deployment indices mapping for O(1) lookups
         # Maps model_name -> list of indices in model_list
         self.model_name_to_deployment_indices: dict[str, list[int]] = {}
@@ -8332,6 +8333,8 @@ class Router:
                 self.model_name_to_deployment_indices[model_name] = updated_indices
             else:
                 del self.model_name_to_deployment_indices[model_name]
+
+        self.model_names.intersection_update(self.model_name_to_deployment_indices)
 
         # Update team_model_to_deployment_indices
         for key, indices in list(self.team_model_to_deployment_indices.items()):
