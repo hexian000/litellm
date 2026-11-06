@@ -21,6 +21,7 @@ from litellm.proxy.management_endpoints.proxy_runtime_state import CALLBACK_REGI
 from litellm.proxy.management_endpoints.router_settings_endpoints import router
 from litellm.proxy.utils import PrismaClient
 from litellm.router import Router
+from litellm.types.router import Deployment
 
 
 @pytest.fixture
@@ -216,6 +217,45 @@ def test_full_proxy_actual_master_key_authentication(serving):
     assert denied.status_code in (401, 403)
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["routing"]["runtime"]["deployments"][0]["model_id"] == "selected"
+
+
+@pytest.mark.parametrize("path", ["/router/runtime-state/routing", "/router/runtime-state/preprocessing"])
+def test_full_proxy_inspects_dynamic_router_inventory(serving: Router, path: str) -> None:
+    dynamic = Router()
+    with (
+        patch.object(proxy, "llm_router", dynamic),
+        patch.object(proxy, "master_key", "sk-local-master-inspection-only"),
+    ):
+        client = TestClient(proxy.app, headers={"Authorization": "Bearer sk-local-master-inspection-only"})
+        empty = client.get(path)
+        assert empty.status_code == 200, empty.text
+        empty_routing = empty.json() if path.endswith("/routing") else empty.json()["routing"]
+        assert empty_routing["model_names"] == []
+        assert empty_routing["runtime"]["deployments"] == []
+        dynamic.add_deployment(
+            Deployment(
+                model_name="dynamic-model",
+                model_info={"id": "dynamic-selected"},
+                litellm_params={"model": "deepseek/deepseek-chat", "api_key": "private-dynamic-credential"},
+            )
+        )
+        accepted = client.get(path)
+        denied = TestClient(proxy.app).get(path)
+        dynamic.delete_deployment("dynamic-selected")
+        removed = client.get(path)
+    assert accepted.status_code == 200, accepted.text
+    routing = accepted.json() if path.endswith("/routing") else accepted.json()["routing"]
+    assert routing["model_names"] == ["dynamic-model"]
+    assert routing["model_name_to_deployment_indices"] == {"dynamic-model": [0]}
+    assert routing["runtime"]["deployments"][0]["model_id"] == "dynamic-selected"
+    assert routing["runtime"]["boot_id"] == empty_routing["runtime"]["boot_id"]
+    assert denied.status_code in (401, 403)
+    assert "private-dynamic-credential" not in accepted.text
+    assert "sk-local-master-inspection-only" not in accepted.text
+    assert removed.status_code == 200, removed.text
+    removed_routing = removed.json() if path.endswith("/routing") else removed.json()["routing"]
+    assert removed_routing["model_names"] == []
+    assert removed_routing["runtime"]["deployments"] == []
 
 
 def test_http_observes_proxy_dispatch_inputs_and_cli_drop_presence(serving):

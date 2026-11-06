@@ -48,6 +48,47 @@ def runtime_client(serving_router, role=LitellmUserRoles.PROXY_ADMIN, *, raise_s
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
+def test_dynamic_router_model_names_are_isolated() -> None:
+    first = Router()
+    second = Router()
+    first.add_deployment(
+        Deployment(
+            model_name="bounded",
+            model_info={"id": "first-selected"},
+            litellm_params={"model": "deepseek/deepseek-chat", "api_key": "private-first"},
+        )
+    )
+    assert second.model_names == set()
+    second.add_deployment(
+        Deployment(
+            model_name="unrelated",
+            model_info={"id": "second-selected"},
+            litellm_params={"model": "deepseek/deepseek-chat", "api_key": "private-second"},
+        )
+    )
+    assert first.model_names == {"bounded"}
+    assert second.model_names == {"unrelated"}
+    assert router_runtime_state.snapshot_routing(first).model_names == ("bounded",)
+    assert router_runtime_state.snapshot_routing(second).model_names == ("unrelated",)
+
+
+def test_routing_snapshot_tracks_removal_of_the_last_group_deployment() -> None:
+    serving = runtime_router()
+    serving.add_deployment(
+        Deployment(
+            model_name="bounded",
+            model_info={"id": "second-selected"},
+            litellm_params={"model": "deepseek/deepseek-chat", "api_key": "private-second"},
+        )
+    )
+    serving.delete_deployment("selected")
+    assert router_runtime_state.snapshot_routing(serving).model_names == ("bounded", "unrelated")
+    serving.delete_deployment("second-selected")
+    assert router_runtime_state.snapshot_routing(serving).model_names == ("unrelated",)
+    serving.delete_deployment("unrelated")
+    assert router_runtime_state.snapshot_routing(serving).model_names == ()
+
+
 def test_runtime_http_preserves_effective_defaults_and_retained_keyspace():
     serving = runtime_router()
     serving.update_settings(default_litellm_params={})
