@@ -166,8 +166,12 @@ async def persist(handle: RequestHandle, attempt: AttemptHandle) -> None:
         )
     )
     attempt.body = body
-    attempt.body = await handle.store.finish(handle.row, attempt.row, body)
+    completed = await handle.store.finish(handle.row, attempt.row, body)
+    attempt.body = completed
     attempt.persisted = True
+    from .evidence import apply_retained_source
+
+    background(apply_retained_source(handle.store, attempt.row, completed))
 
 
 async def persist_until_available(handle: RequestHandle, attempt: AttemptHandle) -> None:

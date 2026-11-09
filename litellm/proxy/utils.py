@@ -124,6 +124,7 @@ from litellm.proxy.db.exception_handler import (
 from litellm.proxy.db.log_db_metrics import log_db_metrics
 from litellm.proxy.db.prisma_client import (
     PrismaWrapper,
+    default_prisma_http_config,
     parse_iam_endpoint_from_url,
 )
 from litellm.proxy.db.routing_prisma_wrapper import RoutingPrismaWrapper
@@ -3037,7 +3038,7 @@ class PrismaClient:
             )
         else:
             writer_wrapper = PrismaWrapper(
-                original_prisma=Prisma(),
+                original_prisma=Prisma(http=default_prisma_http_config()),
                 iam_token_db_auth=iam_flag,
                 log_prefix=writer_log_prefix,
             )
@@ -3079,7 +3080,7 @@ class PrismaClient:
                 if http_client is not None:
                     reader_prisma = Prisma(http=http_client, **reader_kwargs)
                 else:
-                    reader_prisma = Prisma(**reader_kwargs)
+                    reader_prisma = Prisma(http=default_prisma_http_config(), **reader_kwargs)
                 reader_wrapper = PrismaWrapper(
                     original_prisma=reader_prisma,
                     iam_token_db_auth=iam_flag,

@@ -183,7 +183,26 @@ async def capture(store: Store, payload: Mapping[str, object]) -> None:
         }
     )
     await store.retain_source(attempts[0], source)
-    await apply_source(store, attempts[0], source)
+    current = (
+        attempts[0]
+        if attempts[0].usage_known
+        else ATTEMPTS.validate_python(
+            await store.database.writer_db.query_raw("SELECT * FROM litellm_usage.attempt WHERE id=$1", attempts[0].id)
+        )[0]
+    )
+    await apply_source(store, current, source)
+
+
+async def apply_retained_source(store: Store, attempt: AttemptRow, completed: Attempt) -> None:
+    try:
+        source = await store.retained_source(attempt)
+        if source is not None:
+            current = attempt.model_copy(
+                update=MappingProxyType({"body": completed, "usage_known": isinstance(completed.usage, KnownUsage)})
+            )
+            await apply_source(store, current, source)
+    except JOURNAL_ERRORS as error:
+        logger.error("supplier retained evidence pending attempt=%s error=%s", attempt.id, type(error).__name__)
 
 
 async def recover_evidence(store: Store) -> int:
