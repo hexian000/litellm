@@ -117,12 +117,7 @@ async def apply_source(store: Store, attempt: AttemptRow, payload: Mapping[str, 
                 usage=reported,
                 supplierAttempted=True,
             )
-            await store.finish(request, attempt, recovered)
-            body = (
-                body.model_copy(update=MappingProxyType({"usage": reported}))
-                if body is not None and body.outcome != "unknown"
-                else recovered
-            )
+            body = await store.finish(request, attempt, recovered)
     if body is None or body.endedAt is None or body.outcome == "unknown":
         return
     first = moment(payload.get("completionStartTime"))

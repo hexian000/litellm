@@ -166,7 +166,7 @@ async def persist(handle: RequestHandle, attempt: AttemptHandle) -> None:
         )
     )
     attempt.body = body
-    await handle.store.finish(handle.row, attempt.row, body)
+    attempt.body = await handle.store.finish(handle.row, attempt.row, body)
     attempt.persisted = True
 
 

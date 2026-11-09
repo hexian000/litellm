@@ -216,33 +216,44 @@ class Store:
             await tx.execute_raw("UPDATE litellm_usage.control SET unknown_attempts=unknown_attempts+1 WHERE id=1")
             return ATTEMPTS.validate_python(rows)[0]
 
-    async def finish(self, request: RequestRow, attempt: AttemptRow, body: Attempt) -> None:
+    async def finish(self, request: RequestRow, attempt: AttemptRow, body: Attempt) -> Attempt:
         async with self.transaction() as tx:
             rows = ATTEMPTS.validate_python(
                 await tx.query_raw("SELECT * FROM litellm_usage.attempt WHERE id=$1 FOR UPDATE", attempt.id)
             )
             previous = rows[0]
-            if previous.body == body:
-                return
+            incoming = (
+                body.model_copy(update=MappingProxyType({"endedAt": previous.body.endedAt}))
+                if previous.body is not None
+                and previous.body.outcome != "unknown"
+                and previous.body.outcome == body.outcome
+                else body
+            )
+            if previous.body == incoming:
+                return incoming
             if previous.usage_known:
-                if previous.body is not None and previous.body != body:
+                if previous.body is not None and previous.body != incoming:
                     await tx.execute_raw("UPDATE litellm_usage.request SET conflicted=true WHERE id=$1", request.id)
-                    await self.emit(tx, request, body, previous.version + 1)
-                return
-            if previous.body is not None and previous.body.outcome != "unknown":
-                body = previous.body.model_copy(update=MappingProxyType({"usage": body.usage}))
+                    await self.emit(tx, request, incoming, previous.version + 1)
+                return previous.body if previous.body is not None else incoming
+            completed = (
+                previous.body.model_copy(update=MappingProxyType({"usage": incoming.usage}))
+                if previous.body is not None and previous.body.outcome != "unknown"
+                else incoming
+            )
             version = previous.version + 1
             await tx.execute_raw(
                 "\n                UPDATE litellm_usage.attempt SET ended_at=$2::text::timestamptz, version=$3, usage_known=$4, body=$5::jsonb\n                WHERE id=$1\n            ",
                 attempt.id,
-                body.endedAt.isoformat() if body.endedAt is not None else None,
+                completed.endedAt.isoformat() if completed.endedAt is not None else None,
                 version,
-                body.usage.state == "known",
-                body.model_dump_json(),
+                completed.usage.state == "known",
+                completed.model_dump_json(),
             )
-            if body.usage.state == "known":
+            if completed.usage.state == "known":
                 await tx.execute_raw("UPDATE litellm_usage.control SET unknown_attempts=unknown_attempts-1 WHERE id=1")
-            await self.emit(tx, request, body, version)
+            await self.emit(tx, request, completed, version)
+            return completed
 
     async def close(self, request: RequestRow, outcome: str) -> None:
         async with self.transaction() as tx:

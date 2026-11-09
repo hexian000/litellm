@@ -322,6 +322,123 @@ async def test_closed_request_missing_attempt_is_recovered_from_durable_source(s
     }
 
 
+@pytest.mark.parametrize("source_first", [False, True])
+async def test_stale_native_source_preserves_the_first_committed_completion(store: Store, source_first: bool) -> None:
+    from datetime import timedelta
+
+    from litellm.proxy.usage_journal.evidence import apply_source
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    finished = Attempt(
+        type="attempt.finished",
+        attemptId=attempt.id,
+        logId=attempt.log_id,
+        ordinal=1,
+        kind="primary",
+        model=attempt.model,
+        modelGroup=attempt.model_group,
+        deploymentId=None,
+        provider=None,
+        startedAt=attempt.started_at,
+        endedAt=attempt.started_at + timedelta(milliseconds=2),
+        outcome="success",
+        supplierAttempted=True,
+        usage=KnownUsage(state="known", promptTokens=7, completionTokens=1, cacheReadTokens=0),
+    )
+    source = {
+        "request_id": attempt.log_id,
+        "endTime": (attempt.started_at + timedelta(milliseconds=1)).isoformat(),
+        "prompt_tokens": 7,
+        "completion_tokens": 1,
+        "spend": "0.000009",
+        "status": "success",
+        "call_type": "acompletion",
+    }
+    await store.close(row, "success")
+    if source_first:
+        await apply_source(store, attempt, source)
+        await store.finish(row, attempt, finished)
+    else:
+        await store.finish(row, attempt, finished)
+        await apply_source(store, attempt, source)
+    await apply_source(store, attempt, source)
+    conflicts = await store.database.writer_db.query_raw(
+        "SELECT conflicted FROM litellm_usage.request WHERE id=$1", row.id
+    )
+    assert conflicts == [{"conflicted": False}]
+    events = UsageBatch.model_validate(
+        {
+            "events": [
+                r["payload"]
+                for r in await store.database.writer_db.query_raw(
+                    "SELECT payload FROM litellm_usage.outbox WHERE event_id=$1 ORDER BY version",
+                    f"{row.id}/attempt/{attempt.id}",
+                )
+            ]
+        }
+    ).events
+    assert len(events) == 1
+    assert isinstance(events[0].body, Attempt)
+    expected = attempt.started_at + timedelta(milliseconds=1 if source_first else 2)
+    assert events[0].body.endedAt == expected
+    observation = await store.database.writer_db.query_raw(
+        "SELECT observation FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
+    )
+    assert observation[0]["observation"]["endedAt"] == events[0].body.model_dump(mode="json")["endedAt"]
+
+
+async def test_stale_native_source_retains_contradictory_known_usage(store: Store) -> None:
+    from datetime import timedelta
+
+    from litellm.proxy.usage_journal.evidence import apply_source
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    finished = Attempt(
+        type="attempt.finished",
+        attemptId=attempt.id,
+        logId=attempt.log_id,
+        ordinal=1,
+        kind="primary",
+        model=attempt.model,
+        modelGroup=attempt.model_group,
+        deploymentId=None,
+        provider=None,
+        startedAt=attempt.started_at,
+        endedAt=attempt.started_at + timedelta(milliseconds=2),
+        outcome="success",
+        supplierAttempted=True,
+        usage=KnownUsage(state="known", promptTokens=7, completionTokens=1, cacheReadTokens=0),
+    )
+    await store.finish(row, attempt, finished)
+    await store.close(row, "success")
+    await apply_source(
+        store,
+        attempt,
+        {
+            "request_id": attempt.log_id,
+            "endTime": (attempt.started_at + timedelta(milliseconds=1)).isoformat(),
+            "prompt_tokens": 8,
+            "completion_tokens": 1,
+            "spend": "0.000009",
+            "status": "success",
+            "call_type": "acompletion",
+        },
+    )
+    assert await store.database.writer_db.query_raw(
+        "SELECT conflicted FROM litellm_usage.request WHERE id=$1", row.id
+    ) == [{"conflicted": True}]
+    versions = await store.database.writer_db.query_raw(
+        "SELECT version FROM litellm_usage.outbox WHERE event_id=$1 ORDER BY version", f"{row.id}/attempt/{attempt.id}"
+    )
+    assert versions == [{"version": 1}, {"version": 2}]
+
+
 async def test_native_spend_capture_retains_source_before_log_delivery(store: Store) -> None:
     from litellm.proxy.usage_journal.evidence import capture, recover_evidence
 
