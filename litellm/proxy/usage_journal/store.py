@@ -80,6 +80,20 @@ ATTEMPTS = TypeAdapter(Sequence[AttemptRow])
 DELIVERIES = TypeAdapter(Sequence[Delivery])
 
 
+def _retain_native_first_response(previous: Observation | None, body: Observation) -> Observation:
+    if previous is None or previous.firstResponseAt is None or body.firstResponseAt is None:
+        return body
+    earlier, incoming = previous.firstResponseAt, body.firstResponseAt
+    if earlier == incoming:
+        return body
+    if (
+        earlier.replace(microsecond=earlier.microsecond // 1000 * 1000) != incoming
+        and incoming.replace(microsecond=incoming.microsecond // 1000 * 1000) != earlier
+    ):
+        return body
+    return body.model_copy(update=MappingProxyType({"firstResponseAt": earlier}))
+
+
 class DeliveryResult(BaseModel):
     id: int
     status: str
@@ -191,7 +205,8 @@ class Store:
     ) -> AttemptRow:
         async with self.transaction() as tx:
             open_rows = await tx.query_raw(
-                "SELECT id FROM litellm_usage.request WHERE id=$1 AND closed_at IS NULL AND instance_id=$2 FOR UPDATE",
+                "SELECT id FROM litellm_usage.request WHERE id=$1 AND closed_at IS NULL "
+                "AND instance_id=$2 FOR NO KEY UPDATE",
                 request.id,
                 self.instance_id,
             )
@@ -258,7 +273,7 @@ class Store:
     async def close(self, request: RequestRow, outcome: str) -> None:
         async with self.transaction() as tx:
             rows = REQUESTS.validate_python(
-                await tx.query_raw("SELECT * FROM litellm_usage.request WHERE id=$1 FOR UPDATE", request.id)
+                await tx.query_raw("SELECT * FROM litellm_usage.request WHERE id=$1 FOR NO KEY UPDATE", request.id)
             )
             if rows[0].closed_at is not None or rows[0].instance_id != self.instance_id:
                 return
@@ -385,47 +400,48 @@ class Store:
                 body.attemptId,
             )
             previous = TypeAdapter(Sequence[Mapping[str, object]]).validate_python(rows)[0]
-            if previous["observation"] is not None:
-                prior = Observation.model_validate(previous["observation"])
-                if prior == body:
+            prior = Observation.model_validate(previous["observation"]) if previous["observation"] is not None else None
+            observed = _retain_native_first_response(prior, body)
+            if prior is not None:
+                if prior == observed:
                     await tx.execute_raw(
                         """
                         UPDATE litellm_usage.recovery SET completed=$2 AND EXISTS(
                             SELECT 1 FROM litellm_usage.attempt WHERE id=$1 AND usage_known)
                         WHERE attempt_id=$1
                     """,
-                        body.attemptId,
-                        isinstance(body.cost, KnownCost),
+                        observed.attemptId,
+                        isinstance(observed.cost, KnownCost),
                     )
                     return
                 if (
                     isinstance(prior.cost, KnownCost)
-                    or prior.model_copy(update=MappingProxyType({"cost": body.cost})) != body
+                    or prior.model_copy(update=MappingProxyType({"cost": observed.cost})) != observed
                 ):
                     await tx.execute_raw("UPDATE litellm_usage.request SET conflicted=true WHERE id=$1", request.id)
                     version = TypeAdapter(int).validate_python(previous["observation_version"]) + 1
-                    await self.emit(tx, request, body, version)
+                    await self.emit(tx, request, observed, version)
                     await tx.execute_raw(
                         """
                         UPDATE litellm_usage.recovery SET observation_version=$2,completed=true WHERE attempt_id=$1
                     """,
-                        body.attemptId,
+                        observed.attemptId,
                         version,
                     )
-                    logger.error("supplier evidence conflict request=%s attempt=%s", request.id, body.attemptId)
+                    logger.error("supplier evidence conflict request=%s attempt=%s", request.id, observed.attemptId)
                     return
             version = TypeAdapter(int).validate_python(previous["observation_version"]) + 1
-            await self.emit(tx, request, body, version)
+            await self.emit(tx, request, observed, version)
             await tx.execute_raw(
                 """
                 UPDATE litellm_usage.recovery SET observation=$2::jsonb, observation_version=$3,
                     completed=$4 AND EXISTS(SELECT 1 FROM litellm_usage.attempt WHERE id=$1 AND usage_known)
                 WHERE attempt_id=$1
             """,
-                body.attemptId,
-                body.model_dump_json(),
+                observed.attemptId,
+                observed.model_dump_json(),
                 version,
-                isinstance(body.cost, KnownCost),
+                isinstance(observed.cost, KnownCost),
             )
 
     async def recovery_candidates(self) -> Sequence[AttemptRow]:
