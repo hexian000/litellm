@@ -142,7 +142,7 @@ async def test_blocked_recovery_does_not_pause_committed_event_delivery(
                 await task
 
 
-async def test_capability_is_query_free_but_offline_admission_still_refuses(
+async def test_capability_and_admission_refuse_an_unavailable_database(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     from fastapi import HTTPException, Request
@@ -171,8 +171,9 @@ async def test_capability_is_query_free_but_offline_admission_still_refuses(
             ],
         }
     )
-    result = await runtime.capability(request)
-    assert result == {"protocol": "litellm-usage/1", "instanceId": "offline", "contractDigest": contract_digest()}
+    with pytest.raises(HTTPException) as unavailable:
+        await runtime.capability(request)
+    assert unavailable.value.status_code == 503
 
     @lifecycle.durable_request
     async def provider(*, request: Request) -> str:

@@ -184,6 +184,12 @@ async def capability(request: Request) -> Mapping[str, str]:
         raise HTTPException(403, "Invalid usage service credential")
     if _state.store is None:
         raise HTTPException(503, "Durable usage journal is unavailable")
+    try:
+        available = await _state.store.check_version()
+    except (PrismaError, httpx.HTTPError, OSError, RuntimeError, ValueError):
+        raise HTTPException(503, "Durable usage journal is unavailable") from None
+    if not available:
+        raise HTTPException(503, "Durable usage journal is unavailable")
     return MappingProxyType(
         {"protocol": PROTOCOL, "instanceId": _state.store.instance_id, "contractDigest": contract_digest()}
     )
