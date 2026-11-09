@@ -1112,6 +1112,10 @@ async def proxy_startup_event(app: FastAPI):
     ## Initialize shared aiohttp session for connection reuse
     shared_aiohttp_session = await _initialize_shared_aiohttp_session()
 
+    from litellm.proxy.usage_journal.runtime import start as start_usage_journal
+
+    await start_usage_journal(prisma_client)
+
     # End of startup event
     yield
 
@@ -1119,6 +1123,10 @@ async def proxy_startup_event(app: FastAPI):
     # so SIGTERM (rolling update, scale-down, liveness kill) doesn't drop them.
     GracefulShutdownManager.start_shutdown()
     await GracefulShutdownManager.wait_for_drain()
+
+    from litellm.proxy.usage_journal.runtime import stop as stop_usage_journal
+
+    await stop_usage_journal()
 
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:
@@ -16792,3 +16800,10 @@ async def dynamic_mcp_route(mcp_server_name: str, request: Request):
     except Exception as e:
         verbose_proxy_logger.exception("Error handling dynamic MCP route for %s: %s", mcp_server_name, str(e))
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/health/usage-protocol", include_in_schema=False)
+async def usage_protocol_capability(request: Request):
+    from litellm.proxy.usage_journal.runtime import capability
+
+    return await capability(request)

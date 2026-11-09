@@ -50,6 +50,7 @@ from litellm.proxy.common_utils.callback_utils import (
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.route_llm_request import route_request
+from litellm.proxy.usage_journal.lifecycle import durable_request
 from litellm.proxy.utils import ProxyLogging, _check_and_merge_model_level_guardrails
 from litellm.router import Router
 from litellm.router_utils.add_retry_fallback_headers import get_hidden_params_dict
@@ -1550,6 +1551,7 @@ class ProxyBaseLLMRequestProcessing:
                 _payload_str,
             )
 
+    @durable_request
     async def base_process_llm_request(
         self,
         request: Request,

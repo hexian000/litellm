@@ -172,6 +172,11 @@ def generate_hash_from_response(response_obj: Any) -> str:
 
 
 def get_spend_logs_id(call_type: str, response_obj: dict, kwargs: dict) -> str | None:
+    from litellm.proxy.usage_journal.lifecycle import current_attempt, stream_attempt
+
+    journal_attempt = current_attempt.get() or stream_attempt.get()
+    if journal_attempt is not None:
+        return journal_attempt.row.log_id
     if call_type == "aretrieve_batch" or call_type == "acreate_file":
         # Generate a hash from the response object
         id: str | None = generate_hash_from_response(response_obj)

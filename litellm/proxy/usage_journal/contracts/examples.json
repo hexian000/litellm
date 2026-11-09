@@ -1,0 +1,75 @@
+{
+  "events": [
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/started",
+      "version": 1,
+      "occurredAt": "2026-11-05T07:45:37.329812Z",
+      "instanceId": "test-a",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "request.started",
+        "startedAt": "2026-11-05T07:45:37.329812Z"
+      },
+      "digest": "5e9eeec36fd964e1fae07f6966a3ab80c7d3a6a48a7e80ba9b49ae2980691037"
+    },
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/attempt/attempt-1",
+      "version": 1,
+      "occurredAt": "2026-11-05T07:45:37.329812Z",
+      "instanceId": "test-a",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "attempt.finished",
+        "attemptId": "attempt-1",
+        "logId": "log-attempt-1",
+        "ordinal": 1,
+        "kind": "primary",
+        "model": "provider/model",
+        "modelGroup": "coding-pro",
+        "deploymentId": null,
+        "provider": "provider",
+        "startedAt": "2026-11-05T07:45:37.329812Z",
+        "endedAt": "2026-11-05T07:45:38.329812Z",
+        "outcome": "success",
+        "usage": {
+          "state": "known",
+          "promptTokens": 100,
+          "completionTokens": 20,
+          "cacheReadTokens": 0
+        }
+      },
+      "digest": "5010e330b41d75061562cd6e8bd93af16283b820e83cb6b600995deb4b8e851b"
+    },
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/closed",
+      "version": 1,
+      "occurredAt": "2026-11-05T07:45:37.329812Z",
+      "instanceId": "test-a",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "request.closed",
+        "endedAt": "2026-11-05T07:45:38.329812Z",
+        "outcome": "success",
+        "attemptIds": [
+          "attempt-1"
+        ]
+      },
+      "digest": "925316aeffb21dc67b047c001d3e8d2a6ba1017003741d6c8fd14e89b57cce28"
+    }
+  ]
+}
