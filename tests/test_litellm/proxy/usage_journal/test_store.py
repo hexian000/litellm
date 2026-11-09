@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -85,6 +86,60 @@ async def test_replay_refused_before_provider_can_be_called(store: Store) -> Non
             )
         )
     assert await store.check_version()
+
+
+async def test_blocked_recovery_does_not_pause_committed_event_delivery(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.usage_journal import runtime
+
+    row = await start(store)
+    recovery_started = asyncio.Event()
+    received = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_recovery(store: Store) -> None:
+        recovery_started.set()
+        await release.wait()
+
+    async def receiver(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        headers = await reader.readuntil(b"\r\n\r\n")
+        length = int(next(
+            line.split(b":", 1)[1].strip() for line in headers.split(b"\r\n")
+            if line.lower().startswith(b"content-length:")
+        ))
+        batch = UsageBatch.model_validate_json(await reader.readexactly(length))
+        body = json.dumps({"acknowledgements": [
+            {"eventId": event.eventId, "version": event.version, "digest": event.digest, "status": "accepted"}
+            for event in batch.events
+        ]}).encode()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                     + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        received.set()
+
+    monkeypatch.setattr(runtime, "recover", blocked_recovery)
+    async with await asyncio.start_server(receiver, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        task = asyncio.create_task(runtime.run(store, f"http://127.0.0.1:{port}/usage", "test-token"))
+        try:
+            await asyncio.wait_for(recovery_started.wait(), timeout=2)
+            await asyncio.wait_for(received.wait(), timeout=1)
+            assert not release.is_set()
+            for attempt in range(20):
+                states = await store.database.writer_db.query_raw(
+                    "SELECT disposition FROM litellm_usage.outbox WHERE request_id=$1", row.id
+                )
+                if states == [{"disposition": "delivered"}]:
+                    break
+                await asyncio.sleep(0.01)
+            assert states == [{"disposition": "delivered"}]
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 async def test_capability_is_query_free_but_offline_admission_still_refuses(
@@ -203,6 +258,108 @@ async def test_multiworker_claims_are_disjoint_and_expire_for_takeover(store: St
     )
     reclaimed = await other.claim()
     assert any(d.payload.requestId == row.id for d in reclaimed)
+
+
+async def test_supplier_evidence_work_does_not_delay_committed_completion(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.usage_journal import evidence
+    from litellm.proxy.usage_journal.lifecycle import AttemptHandle, RequestHandle, persist
+    from litellm.proxy.usage_journal.store import AttemptRow
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_source(store: Store, attempt: AttemptRow, completed: Attempt) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(evidence, "apply_retained_source", blocked_source)
+    handle = AttemptHandle(
+        attempt, usage=KnownUsage(state="known", promptTokens=7, completionTokens=1, cacheReadTokens=0),
+        outcome="success", called=True,
+    )
+    try:
+        await asyncio.wait_for(persist(RequestHandle(store, row), handle), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert not release.is_set()
+        assert await store.database.writer_db.query_raw(
+            "SELECT usage_known FROM litellm_usage.attempt WHERE id=$1", attempt.id
+        ) == [{"usage_known": True}]
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("retained_after_finish", [False, True])
+async def test_retained_supplier_source_finishes_without_periodic_recovery(
+    store: Store, retained_after_finish: bool
+) -> None:
+    from litellm.proxy.usage_journal.evidence import capture
+    from litellm.proxy.usage_journal.lifecycle import AttemptHandle, RequestHandle, persist
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    payload = {
+        "request_id": attempt.log_id,
+        "endTime": attempt.started_at.isoformat(),
+        "prompt_tokens": 7,
+        "completion_tokens": 1,
+        "spend": "0.000009",
+        "status": "success",
+        "call_type": "acompletion",
+    }
+    handle = AttemptHandle(
+        attempt,
+        usage=KnownUsage(state="known", promptTokens=7, completionTokens=1, cacheReadTokens=0),
+        outcome="success",
+        called=True,
+    )
+    if retained_after_finish:
+        async with store.database.tx() as blocker:
+            await blocker.query_raw(
+                "SELECT attempt_id FROM litellm_usage.recovery WHERE attempt_id=$1 FOR UPDATE", attempt.id
+            )
+            capturing = asyncio.create_task(capture(store, payload))
+
+            async def wait_for_blocked_source() -> None:
+                while True:
+                    waiting = await store.database.writer_db.query_raw(
+                        "SELECT count(*)::integer AS count FROM pg_stat_activity "
+                        "WHERE datname=current_database() AND wait_event_type='Lock' "
+                        "AND query LIKE '%UPDATE litellm_usage.recovery SET source_payload%'"
+                    )
+                    if waiting == [{"count": 1}]:
+                        return
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_blocked_source(), timeout=2)
+            await persist(RequestHandle(store, row), handle)
+        await capturing
+    else:
+        await capture(store, payload)
+        await persist(RequestHandle(store, row), handle)
+    async def wait_for_supplier_completion() -> None:
+        while True:
+            completed = await store.database.writer_db.query_raw(
+                "SELECT completed FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
+            )
+            if completed == [{"completed": True}]:
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_supplier_completion(), timeout=1)
+    observations = await store.database.writer_db.query_raw(
+        "SELECT count(*)::integer AS count FROM litellm_usage.outbox WHERE event_id=$1",
+        f"{row.id}/observation/{attempt.id}",
+    )
+    assert observations == [{"count": 1}]
 
 
 async def test_ack_loss_retries_and_partial_ack_never_drops_an_event(store: Store) -> None:

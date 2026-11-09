@@ -8,7 +8,6 @@ import secrets
 import socket
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -108,26 +107,40 @@ async def recover(store: Store) -> None:
         await store.close(row, "unknown")
 
 
+async def run_delivery(store: Store, client: httpx.AsyncClient, url: str, token: str) -> None:
+    delay = 0.05
+    while True:
+        try:
+            processed = await deliver(store, client, url, token)
+            delay = 0.05 if processed else min(1.0, delay * 2)
+        except (PrismaError, httpx.HTTPError, OSError, RuntimeError, ValueError) as error:
+            logger.error("usage worker retrying error=%s", type(error).__name__)
+            await asyncio.sleep(1)
+        await asyncio.sleep(delay)
+
+
+async def run_maintenance(store: Store) -> None:
+    loop = asyncio.get_running_loop()
+    while True:
+        started = loop.time()
+        try:
+            await store.heartbeat(int(os.getenv("LITELLM_USAGE_MAX_BYTES", str(10 * 1024**3))))
+            await recover(store)
+            from .evidence import recover_evidence
+
+            await recover_evidence(store)
+        except (PrismaError, httpx.HTTPError, OSError, RuntimeError, ValueError) as error:
+            logger.error("usage recovery retrying error=%s", type(error).__name__)
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(max(0.05, 10 - (loop.time() - started)))
+
+
 async def run(store: Store, url: str, token: str) -> None:
     async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
-        last_maintenance = datetime.min.replace(tzinfo=UTC)
-        delay = 0.05
-        while True:
-            try:
-                now = datetime.now(UTC)
-                if (now - last_maintenance).total_seconds() >= 10:
-                    await store.heartbeat(int(os.getenv("LITELLM_USAGE_MAX_BYTES", str(10 * 1024**3))))
-                    await recover(store)
-                    from .evidence import recover_evidence
-
-                    await recover_evidence(store)
-                    last_maintenance = now
-                processed = await deliver(store, client, url, token)
-                delay = 0.05 if processed else min(1.0, delay * 2)
-            except (PrismaError, httpx.HTTPError, OSError, RuntimeError, ValueError) as error:
-                logger.error("usage worker retrying error=%s", type(error).__name__)
-                await asyncio.sleep(1)
-            await asyncio.sleep(delay)
+        async with asyncio.TaskGroup() as workers:
+            workers.create_task(run_delivery(store, client, url, token), name="usage_delivery")
+            workers.create_task(run_maintenance(store), name="usage_recovery")
 
 
 @dataclass

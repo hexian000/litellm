@@ -561,16 +561,19 @@ class Store:
         )
         return REQUESTS.validate_python(rows)[0]
 
-    async def spend_log(self, attempt: AttemptRow) -> Mapping[str, object] | None:
+    async def retained_source(self, attempt: AttemptRow) -> Mapping[str, object] | None:
         retained = await self.database.writer_db.query_raw(
             "SELECT source_payload FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
         )
         stored = TypeAdapter(Sequence[Mapping[str, object]]).validate_python(retained)
-        source = (
+        return (
             TypeAdapter(Mapping[str, object]).validate_python(stored[0]["source_payload"])
             if stored and stored[0]["source_payload"] is not None
             else None
         )
+
+    async def spend_log(self, attempt: AttemptRow) -> Mapping[str, object] | None:
+        source = await self.retained_source(attempt)
         tables = await self.database.writer_db.query_raw("SELECT to_regclass('\"LiteLLM_SpendLogs\"')::text AS name")
         if not TypeAdapter(Sequence[Mapping[str, str | None]]).validate_python(tables)[0]["name"]:
             return source
