@@ -1,0 +1,110 @@
+{
+  "events": [
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/started",
+      "version": 1,
+      "occurredAt": "2026-11-09T07:52:00.589550Z",
+      "instanceId": "contract-example",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "request.started",
+        "startedAt": "2026-11-09T07:52:00.568660Z"
+      },
+      "digest": "b0a7a9452d814338b5738ee8868af841c9466535aefd4442fff83824d66e7409"
+    },
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/attempt/example-attempt",
+      "version": 1,
+      "occurredAt": "2026-11-09T07:52:00.659003Z",
+      "instanceId": "contract-example",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "attempt.finished",
+        "attemptId": "example-attempt",
+        "logId": "example-attempt",
+        "ordinal": 1,
+        "kind": "primary",
+        "model": "provider/model",
+        "modelGroup": "coding-pro",
+        "deploymentId": null,
+        "provider": "provider",
+        "startedAt": "2026-11-09T07:52:00.608387Z",
+        "endedAt": "2026-11-09T07:52:00.641134Z",
+        "outcome": "success",
+        "usage": {
+          "state": "known",
+          "promptTokens": 100,
+          "completionTokens": 20,
+          "cacheReadTokens": 0
+        },
+        "supplierAttempted": true
+      },
+      "digest": "4054275b59ab3c42045063b2432e3338a660a68c32e4bab9eca5cc6cc3251c33"
+    },
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/closed",
+      "version": 1,
+      "occurredAt": "2026-11-09T07:52:00.705592Z",
+      "instanceId": "contract-example",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "request.closed",
+        "endedAt": "2026-11-09T07:52:00.700326Z",
+        "outcome": "success",
+        "attemptIds": [
+          "example-attempt"
+        ]
+      },
+      "digest": "77f283ed680333d738ccdc5a88c3c95a330b8a48792a0ea1632f7c7ef061a471"
+    },
+    {
+      "protocol": "litellm-usage/1",
+      "eventId": "01K00000000000000000000000/observation/example-attempt",
+      "version": 1,
+      "occurredAt": "2026-11-09T07:52:00.724998Z",
+      "instanceId": "contract-example",
+      "requestId": "01K00000000000000000000000",
+      "traceId": "example-trace",
+      "projectId": "example-project",
+      "customerModel": "coding-pro",
+      "mode": "active",
+      "body": {
+        "type": "attempt.observed",
+        "attemptId": "example-attempt",
+        "logId": "example-attempt",
+        "deploymentId": null,
+        "providerModelId": null,
+        "startedAt": "2026-11-09T07:52:00.608387Z",
+        "endedAt": "2026-11-09T07:52:00.641134Z",
+        "firstResponseAt": null,
+        "outcome": "success",
+        "statusCode": 200,
+        "supplierAttempted": true,
+        "requestType": "acompletion",
+        "stream": false,
+        "cost": {
+          "state": "known",
+          "amount": "0.000123",
+          "currency": "USD",
+          "source": "spend_log"
+        }
+      },
+      "digest": "7daf3264e94d77b40ed3a06f46c888bb4b36ba3aba46eaa711d9bf26e91be9e4"
+    }
+  ]
+}

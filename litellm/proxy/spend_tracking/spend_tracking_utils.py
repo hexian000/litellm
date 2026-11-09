@@ -172,6 +172,11 @@ def generate_hash_from_response(response_obj: Any) -> str:
 
 
 def get_spend_logs_id(call_type: str, response_obj: dict, kwargs: dict) -> str | None:
+    from litellm.proxy.usage_journal.lifecycle import current_attempt, stream_attempt
+
+    journal_attempt = current_attempt.get() or stream_attempt.get()
+    if journal_attempt is not None:
+        return journal_attempt.row.log_id
     if call_type == "aretrieve_batch" or call_type == "acreate_file":
         # Generate a hash from the response object
         id: str | None = generate_hash_from_response(response_obj)
@@ -396,7 +401,12 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
         cache_key = litellm.cache.get_cache_key(**kwargs)
     else:
         cache_key = "Cache OFF"
-    if cache_hit is True:
+    from litellm.proxy.usage_journal.lifecycle import current_attempt, stream_attempt
+
+    journal_attempt = current_attempt.get() or stream_attempt.get()
+    if journal_attempt is not None:
+        additional_usage_values["journal_cost_known"] = kwargs.get("response_cost") is not None
+    if cache_hit is True and journal_attempt is None:
         import time
 
         id = f"{id}_cache_hit{time.time()}"  # SpendLogs does not allow duplicate request_id

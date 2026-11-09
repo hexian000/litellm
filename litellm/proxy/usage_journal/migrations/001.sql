@@ -1,0 +1,12 @@
+CREATE SCHEMA IF NOT EXISTS litellm_usage;
+CREATE TABLE litellm_usage.revision (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now(), operation_id text NOT NULL);
+CREATE TABLE litellm_usage.instance (id text PRIMARY KEY, heartbeat_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE litellm_usage.request (id text PRIMARY KEY, trace_id text NOT NULL, project_id text NOT NULL, customer_model text NOT NULL, mode text NOT NULL CHECK (mode IN ('active','shadow')), instance_id text NOT NULL, started_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz, outcome text, conflicted boolean NOT NULL DEFAULT false);
+CREATE TABLE litellm_usage.attempt (id text PRIMARY KEY, request_id text NOT NULL REFERENCES litellm_usage.request(id), ordinal integer NOT NULL, log_id text NOT NULL UNIQUE, model text NOT NULL, model_group text NOT NULL, deployment_id text, provider text, kind text NOT NULL, started_at timestamptz NOT NULL DEFAULT now(), ended_at timestamptz, version integer NOT NULL DEFAULT 0, usage_known boolean NOT NULL DEFAULT false, body jsonb, UNIQUE(request_id, ordinal));
+CREATE TABLE litellm_usage.outbox (id bigserial PRIMARY KEY, event_id text NOT NULL, version integer NOT NULL, request_id text NOT NULL REFERENCES litellm_usage.request(id), payload jsonb, digest text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), delivered_at timestamptz, lease_owner text, lease_until timestamptz, next_attempt_at timestamptz NOT NULL DEFAULT now(), attempts integer NOT NULL DEFAULT 0, disposition text NOT NULL DEFAULT 'pending' CHECK (disposition IN ('pending','delivered','quarantined')), reason text, UNIQUE(event_id, version));
+CREATE INDEX usage_outbox_due ON litellm_usage.outbox(next_attempt_at, id) WHERE disposition = 'pending';
+CREATE INDEX usage_outbox_retention ON litellm_usage.outbox(delivered_at, id) WHERE disposition = 'delivered' AND payload IS NOT NULL;
+CREATE INDEX usage_attempt_request ON litellm_usage.attempt(request_id);
+CREATE INDEX usage_request_open ON litellm_usage.request(instance_id) WHERE closed_at IS NULL;
+CREATE TABLE litellm_usage.control (id integer PRIMARY KEY CHECK(id = 1), pending bigint NOT NULL DEFAULT 0, open_requests bigint NOT NULL DEFAULT 0, unknown_attempts bigint NOT NULL DEFAULT 0, admitted boolean NOT NULL DEFAULT true);
+INSERT INTO litellm_usage.control(id) VALUES (1);

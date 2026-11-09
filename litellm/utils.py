@@ -1586,10 +1586,22 @@ def client(original_function):
         if "litellm_call_id" not in kwargs:
             kwargs["litellm_call_id"] = str(uuid.uuid4())
 
+        usage_lifecycle = sys.modules.get("litellm.proxy.usage_journal.lifecycle")
+
         model: str | None = args[0] if len(args) > 0 else kwargs.get("model", None)
         is_completion_with_fallbacks = kwargs.get("fallbacks") is not None
         kwargs.pop("_is_litellm_internal_call", None)  # discard if injected
         _is_litellm_internal_call = is_internal_call.get()
+
+        usage_attempt, usage_token = (
+            await usage_lifecycle.begin_attempt(model, kwargs.get("metadata"), kwargs.get("model_info"))
+            if usage_lifecycle is not None
+            else (None, None)
+        )
+        if usage_attempt is not None:
+            kwargs["litellm_call_id"] = usage_attempt.row.log_id
+            kwargs["num_retries"] = 0
+            kwargs["context_window_fallback_dict"] = None
 
         try:
             if logging_obj is None:
@@ -1639,10 +1651,12 @@ def client(original_function):
                     _caching_handler_response.cached_result is not None
                     and _caching_handler_response.final_embedding_cached_response is None
                 ):
-                    return _caching_handler_response.cached_result
+                    result = _caching_handler_response.cached_result
+                    return result
 
                 elif _caching_handler_response.embedding_all_elements_cache_hit is True:
-                    return _caching_handler_response.final_embedding_cached_response
+                    result = _caching_handler_response.final_embedding_cached_response
+                    return result
 
             # CHECK MAX TOKENS
             if (
@@ -1678,6 +1692,8 @@ def client(original_function):
                     print_verbose(f"Error while checking max token limit: {e!s}")
 
             # MODEL CALL
+            if usage_attempt is not None:
+                usage_attempt.called = True
             result = await original_function(*args, **kwargs)
             end_time = datetime.datetime.now()
 
@@ -1802,6 +1818,10 @@ def client(original_function):
                     raise e
 
             call_type = original_function.__name__
+            if usage_attempt is not None:
+                await usage_lifecycle.capture_failure(
+                    logging_obj.model_call_details if logging_obj is not None else kwargs, start_time, end_time, e
+                )
             num_retries, kwargs = _get_wrapper_num_retries(kwargs=kwargs, exception=e)
             if call_type == CallTypes.acompletion.value:
                 context_window_fallback_dict = kwargs.get("context_window_fallback_dict", {})
@@ -1862,6 +1882,9 @@ def client(original_function):
             timeout = _get_wrapper_timeout(kwargs=kwargs, exception=e)
             setattr(e, "timeout", timeout)
             raise e
+        finally:
+            if usage_lifecycle is not None:
+                await usage_lifecycle.end_attempt(usage_attempt, usage_token, result)
 
     get_coroutine_checker = getattr(sys.modules[__name__], "get_coroutine_checker")
     is_coroutine = get_coroutine_checker().is_async_callable(original_function)

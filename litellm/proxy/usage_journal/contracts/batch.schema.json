@@ -1,0 +1,623 @@
+{
+  "$defs": {
+    "Attempt": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "attempt.finished",
+          "title": "Type",
+          "type": "string"
+        },
+        "attemptId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Attemptid",
+          "type": "string"
+        },
+        "logId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Logid",
+          "type": "string"
+        },
+        "ordinal": {
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "primary",
+            "retry",
+            "fallback"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "model": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Model",
+          "type": "string"
+        },
+        "modelGroup": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Modelgroup",
+          "type": "string"
+        },
+        "deploymentId": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Deploymentid"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "title": "Startedat",
+          "type": "string"
+        },
+        "endedAt": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Endedat"
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "cache_hit",
+            "unknown"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "usage": {
+          "discriminator": {
+            "mapping": {
+              "known": "#/$defs/KnownUsage",
+              "unknown": "#/$defs/UnknownUsage"
+            },
+            "propertyName": "state"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/KnownUsage"
+            },
+            {
+              "$ref": "#/$defs/UnknownUsage"
+            }
+          ],
+          "title": "Usage"
+        },
+        "supplierAttempted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supplierattempted"
+        }
+      },
+      "required": [
+        "type",
+        "attemptId",
+        "logId",
+        "ordinal",
+        "kind",
+        "model",
+        "modelGroup",
+        "deploymentId",
+        "provider",
+        "startedAt",
+        "endedAt",
+        "outcome",
+        "usage"
+      ],
+      "title": "Attempt",
+      "type": "object"
+    },
+    "Closed": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "request.closed",
+          "title": "Type",
+          "type": "string"
+        },
+        "endedAt": {
+          "format": "date-time",
+          "title": "Endedat",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "unknown"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "attemptIds": {
+          "items": {
+            "maxLength": 191,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.:/-]+$",
+            "type": "string"
+          },
+          "maxItems": 10000,
+          "title": "Attemptids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "endedAt",
+        "outcome",
+        "attemptIds"
+      ],
+      "title": "Closed",
+      "type": "object"
+    },
+    "KnownCost": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "known",
+          "title": "State",
+          "type": "string"
+        },
+        "amount": {
+          "pattern": "^(?:0|[1-9][0-9]{0,11})(?:\\.[0-9]{1,6})?$",
+          "title": "Amount",
+          "type": "string"
+        },
+        "currency": {
+          "const": "USD",
+          "default": "USD",
+          "title": "Currency",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "spend_log",
+            "logging_payload"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "amount",
+        "source"
+      ],
+      "title": "KnownCost",
+      "type": "object"
+    },
+    "KnownUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "known",
+          "title": "State",
+          "type": "string"
+        },
+        "promptTokens": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Prompttokens",
+          "type": "integer"
+        },
+        "completionTokens": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Completiontokens",
+          "type": "integer"
+        },
+        "cacheReadTokens": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "title": "Cachereadtokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "state",
+        "promptTokens",
+        "completionTokens",
+        "cacheReadTokens"
+      ],
+      "title": "KnownUsage",
+      "type": "object"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "attempt.observed",
+          "title": "Type",
+          "type": "string"
+        },
+        "attemptId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Attemptid",
+          "type": "string"
+        },
+        "logId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Logid",
+          "type": "string"
+        },
+        "deploymentId": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Deploymentid"
+        },
+        "providerModelId": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Providermodelid"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "title": "Startedat",
+          "type": "string"
+        },
+        "endedAt": {
+          "format": "date-time",
+          "title": "Endedat",
+          "type": "string"
+        },
+        "firstResponseAt": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Firstresponseat"
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "cache_hit"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "statusCode": {
+          "anyOf": [
+            {
+              "maximum": 599,
+              "minimum": 100,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Statuscode"
+        },
+        "supplierAttempted": {
+          "title": "Supplierattempted",
+          "type": "boolean"
+        },
+        "requestType": {
+          "maxLength": 48,
+          "minLength": 1,
+          "title": "Requesttype",
+          "type": "string"
+        },
+        "stream": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stream"
+        },
+        "cost": {
+          "discriminator": {
+            "mapping": {
+              "known": "#/$defs/KnownCost",
+              "unknown": "#/$defs/UnknownCost"
+            },
+            "propertyName": "state"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/KnownCost"
+            },
+            {
+              "$ref": "#/$defs/UnknownCost"
+            }
+          ],
+          "title": "Cost"
+        }
+      },
+      "required": [
+        "type",
+        "attemptId",
+        "logId",
+        "deploymentId",
+        "startedAt",
+        "endedAt",
+        "outcome",
+        "supplierAttempted",
+        "requestType",
+        "stream",
+        "cost"
+      ],
+      "title": "Observation",
+      "type": "object"
+    },
+    "Started": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "request.started",
+          "title": "Type",
+          "type": "string"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "title": "Startedat",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "startedAt"
+      ],
+      "title": "Started",
+      "type": "object"
+    },
+    "UnknownCost": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "unknown",
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "reason"
+      ],
+      "title": "UnknownCost",
+      "type": "object"
+    },
+    "UnknownUsage": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "unknown",
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "reason"
+      ],
+      "title": "UnknownUsage",
+      "type": "object"
+    },
+    "UsageEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "litellm-usage/1",
+          "title": "Protocol",
+          "type": "string"
+        },
+        "eventId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Eventid",
+          "type": "string"
+        },
+        "version": {
+          "maximum": 2147483647,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "occurredAt": {
+          "format": "date-time",
+          "title": "Occurredat",
+          "type": "string"
+        },
+        "instanceId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Instanceid",
+          "type": "string"
+        },
+        "requestId": {
+          "maxLength": 26,
+          "minLength": 26,
+          "title": "Requestid",
+          "type": "string"
+        },
+        "traceId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Traceid",
+          "type": "string"
+        },
+        "projectId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "title": "Projectid",
+          "type": "string"
+        },
+        "customerModel": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Customermodel",
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "shadow",
+            "active"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "body": {
+          "discriminator": {
+            "mapping": {
+              "attempt.finished": "#/$defs/Attempt",
+              "attempt.observed": "#/$defs/Observation",
+              "request.closed": "#/$defs/Closed",
+              "request.started": "#/$defs/Started"
+            },
+            "propertyName": "type"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Started"
+            },
+            {
+              "$ref": "#/$defs/Attempt"
+            },
+            {
+              "$ref": "#/$defs/Closed"
+            },
+            {
+              "$ref": "#/$defs/Observation"
+            }
+          ],
+          "title": "Body"
+        },
+        "digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "eventId",
+        "version",
+        "occurredAt",
+        "instanceId",
+        "requestId",
+        "traceId",
+        "projectId",
+        "customerModel",
+        "mode",
+        "body",
+        "digest"
+      ],
+      "title": "UsageEvent",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "events": {
+      "items": {
+        "$ref": "#/$defs/UsageEvent"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Events",
+      "type": "array"
+    }
+  },
+  "required": [
+    "events"
+  ],
+  "title": "UsageBatch",
+  "type": "object"
+}
