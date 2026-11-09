@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -86,7 +87,51 @@ async def test_replay_refused_before_provider_can_be_called(store: Store) -> Non
     assert await store.check_version()
 
 
-async def test_attempt_closure_and_outbox_are_transactional(store: Store) -> None:
+async def test_capability_is_query_free_but_offline_admission_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from fastapi import HTTPException, Request
+
+    from litellm.proxy.usage_journal import lifecycle, runtime
+
+    offline = Store(Database(Prisma(use_dotenv=False)), "offline")
+    monkeypatch.setenv("LITELLM_USAGE_REPORT_TOKEN", "test-token")
+    monkeypatch.setattr(runtime, "_state", runtime.RuntimeState(store=offline))
+    monkeypatch.setattr(lifecycle, "_state", lifecycle.LifecycleState(store=offline))
+    caplog.set_level(logging.INFO, logger="httpx")
+    caplog.clear()
+    request = Request(
+        {
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer test-token"),
+                (b"x-guangrouter-usage-token", b"test-token"),
+                (b"x-guangrouter-usage-protocol", b"litellm-usage/1"),
+                (b"x-guangrouter-usage-contract", contract_digest().encode()),
+                (b"x-guangrouter-usage-request", b"0" * 26),
+                (b"x-idempotency-key", b"offline"),
+                (b"x-project-id", b"project"),
+                (b"x-guangrouter-customer-model", b"model"),
+                (b"x-guangrouter-usage-mode", b"active"),
+            ],
+        }
+    )
+    result = await runtime.capability(request)
+    assert result == {"protocol": "litellm-usage/1", "instanceId": "offline", "contractDigest": contract_digest()}
+
+    @lifecycle.durable_request
+    async def provider(*, request: Request) -> str:
+        raise AssertionError("provider must not run without durable admission")
+
+    with pytest.raises(HTTPException) as failed:
+        await provider(request=request)
+    assert failed.value.status_code == 503
+    assert not any(record.name == "httpx" for record in caplog.records)
+
+
+async def test_attempt_closure_and_outbox_are_transactional(store: Store, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="httpx")
+    caplog.clear()
     row = await start(store)
     attempt = await store.begin_attempt(
         row,
@@ -113,6 +158,7 @@ async def test_attempt_closure_and_outbox_are_transactional(store: Store) -> Non
     )
     await store.finish(row, attempt, body)
     await store.close(row, "success")
+    assert sum(record.name == "httpx" for record in caplog.records) <= 20
     events = await store.database.writer_db.query_raw(
         "SELECT payload FROM litellm_usage.outbox WHERE request_id=$1 ORDER BY id", row.id
     )
@@ -124,6 +170,27 @@ async def test_attempt_closure_and_outbox_are_transactional(store: Store) -> Non
         await store.begin_attempt(
             row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
         )
+
+
+async def test_concurrent_attempts_keep_a_fresh_snapshot_after_request_fencing(store: Store) -> None:
+    row = await start(store)
+    writers = (store, Store(store.database, store.instance_id))
+    attempts = await asyncio.gather(
+        *(
+            writers[index % 2].begin_attempt(
+                row,
+                attempt_id=str(uuid4()),
+                model="provider/model",
+                group="model",
+                deployment=None,
+                provider=None,
+            )
+            for index in range(16)
+        )
+    )
+    assert sorted(attempt.ordinal for attempt in attempts) == list(range(1, 17))
+    assert sum(attempt.kind == "primary" for attempt in attempts) == 1
+    assert sum(attempt.kind == "retry" for attempt in attempts) == 15
 
 
 async def test_multiworker_claims_are_disjoint_and_expire_for_takeover(store: Store) -> None:

@@ -13,10 +13,21 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+import httpx
 
 from litellm._logging import verbose_proxy_logger
 from litellm.secret_managers.main import str_to_bool
+
+if TYPE_CHECKING:
+    from prisma.types import HttpConfig
+
+
+def default_prisma_http_config() -> "HttpConfig":
+    from prisma.types import HttpConfig
+
+    return HttpConfig(limits=httpx.Limits(max_connections=1000, max_keepalive_connections=20))
 
 
 @dataclass(frozen=True)
@@ -564,9 +575,7 @@ class PrismaWrapper:
             self._expected_engine_deaths.add(old_engine_pid)
             await self._kill_engine_process(old_engine_pid)
 
-        kwargs: dict[str, Any] = {}
-        if http_client is not None:
-            kwargs["http"] = http_client
+        kwargs: dict[str, Any] = {"http": http_client if http_client is not None else default_prisma_http_config()}
         if self._recreate_uses_datasource:
             kwargs["datasource"] = {"url": new_db_url}
         self._original_prisma = Prisma(**kwargs)
@@ -592,9 +601,9 @@ class PrismaWrapper:
 
         if self._recreate_uses_datasource:
             datasource = DatasourceOverride(url=new_db_url)
-            replacement_prisma = Prisma(datasource=datasource)
+            replacement_prisma = Prisma(datasource=datasource, http=default_prisma_http_config())
         else:
-            replacement_prisma = Prisma()
+            replacement_prisma = Prisma(http=default_prisma_http_config())
 
         old_prisma = self._original_prisma
         old_engine_pid = self._get_engine_pid(old_prisma)

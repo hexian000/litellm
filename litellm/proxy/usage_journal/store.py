@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -106,12 +107,14 @@ class Store:
         self.database = database
         self.instance_id = instance_id
         self.max_pending = max_pending
+        self._transactions = asyncio.Semaphore(4)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[Sql]:
-        async with self.database.tx() as tx:
-            await tx.execute_raw("SET LOCAL lock_timeout = '2s'")
-            await tx.execute_raw("SET LOCAL statement_timeout = '5s'")
+        async with self._transactions, self.database.tx() as tx:
+            await tx.query_raw(
+                "SELECT set_config('lock_timeout', '2s', true), set_config('statement_timeout', '5s', true)"
+            )
             yield tx
 
     async def check_version(self) -> bool:
@@ -128,9 +131,9 @@ class Store:
             2,
         )
 
-    async def emit(
-        self, tx: Sql, request: RequestRow, body: Started | Attempt | Closed | Observation, version: int = 1
-    ) -> None:
+    def event(
+        self, request: RequestRow, body: Started | Attempt | Closed | Observation, version: int = 1
+    ) -> UsageEvent:
         suffix = (
             f"attempt/{body.attemptId}"
             if isinstance(body, Attempt)
@@ -157,41 +160,77 @@ class Store:
                 }
             )
         )
-        event = parsed.model_copy(update=MappingProxyType({"digest": parsed.content_digest()}))
+        return parsed.model_copy(update=MappingProxyType({"digest": parsed.content_digest()}))
+
+    async def emit(
+        self, tx: Sql, request: RequestRow, body: Started | Attempt | Closed | Observation, version: int = 1
+    ) -> None:
+        event = self.event(request, body, version)
         await tx.execute_raw(
-            "\n            INSERT INTO litellm_usage.outbox(event_id, version, request_id, payload, digest)\n            VALUES ($1, $2, $3, $4::jsonb, $5)\n        ",
+            """
+            WITH emitted AS (
+                INSERT INTO litellm_usage.outbox(event_id, version, request_id, payload, digest)
+                VALUES ($1, $2, $3, $4::jsonb, $5) RETURNING id
+            )
+            UPDATE litellm_usage.control SET pending=pending+(SELECT count(*) FROM emitted) WHERE id=1
+            """,
             event.eventId,
             version,
             request.id,
             event.model_dump_json(),
             event.digest,
         )
-        await tx.execute_raw("UPDATE litellm_usage.control SET pending = pending + 1 WHERE id = 1")
 
     async def start(self, admission: Admission) -> RequestRow:
         async with self.transaction() as tx:
-            capacity = await tx.query_raw(
-                "\n                SELECT id FROM litellm_usage.control WHERE id = 1 AND admitted AND pending + open_requests + unknown_attempts < $1 FOR UPDATE\n            ",
-                self.max_pending,
+            request = RequestRow(
+                id=admission.request_id,
+                trace_id=admission.trace_id,
+                project_id=admission.project_id,
+                customer_model=admission.customer_model,
+                mode=admission.mode,
+                instance_id=self.instance_id,
+                started_at=datetime.now(UTC),
             )
-            if not capacity:
-                raise RuntimeError("usage journal capacity exhausted")
+            event = self.event(request, Started(type="request.started", startedAt=request.started_at))
             rows = await tx.query_raw(
-                "\n                INSERT INTO litellm_usage.request(id, trace_id, project_id, customer_model, mode, instance_id)\n                VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING *\n            ",
-                admission.request_id,
-                admission.trace_id,
-                admission.project_id,
-                admission.customer_model,
-                admission.mode,
+                """
+                WITH capacity AS (
+                    SELECT id FROM litellm_usage.control
+                    WHERE id=1 AND admitted AND pending+open_requests+unknown_attempts < $8 FOR UPDATE
+                ), inserted AS (
+                    INSERT INTO litellm_usage.request(
+                        id, trace_id, project_id, customer_model, mode, instance_id, started_at)
+                    SELECT $1,$2,$3,$4,$5,$6,$7::text::timestamptz FROM capacity
+                    ON CONFLICT DO NOTHING RETURNING *
+                ), emitted AS (
+                    INSERT INTO litellm_usage.outbox(event_id, version, request_id, payload, digest)
+                    SELECT $9,1,id,$10::jsonb,$11 FROM inserted RETURNING id
+                ), counted AS (
+                    UPDATE litellm_usage.control SET open_requests=open_requests+1,pending=pending+1
+                    WHERE id=1 AND EXISTS(SELECT 1 FROM emitted) RETURNING id
+                )
+                SELECT inserted.* FROM inserted CROSS JOIN counted
+                """,
+                request.id,
+                request.trace_id,
+                request.project_id,
+                request.customer_model,
+                request.mode,
                 self.instance_id,
+                request.started_at.isoformat(),
+                self.max_pending,
+                event.eventId,
+                event.model_dump_json(),
+                event.digest,
             )
             requests = REQUESTS.validate_python(rows)
-            if not requests:
+            if requests:
+                return requests[0]
+            existing = await tx.query_raw("SELECT id FROM litellm_usage.request WHERE id=$1", request.id)
+            if existing:
                 raise RuntimeError("request journal already exists; provider replay refused")
-            request = requests[0]
-            await tx.execute_raw("UPDATE litellm_usage.control SET open_requests=open_requests+1 WHERE id=1")
-            await self.emit(tx, request, Started(type="request.started", startedAt=request.started_at))
-            return request
+            raise RuntimeError("usage journal capacity exhausted")
 
     async def begin_attempt(
         self,
@@ -212,24 +251,39 @@ class Store:
             )
             if not open_rows:
                 raise RuntimeError("request journal closed; provider call refused")
-            capacity = await tx.query_raw(
-                "SELECT id FROM litellm_usage.control WHERE id=1 AND admitted AND pending + open_requests + unknown_attempts < $1",
-                self.max_pending,
-            )
-            if not capacity:
-                raise RuntimeError("usage journal capacity exhausted")
             rows = await tx.query_raw(
-                "\n                INSERT INTO litellm_usage.attempt(id, request_id, ordinal, log_id, model, model_group,\n                                                  deployment_id, provider, kind)\n                SELECT $1, $2, count(*)::integer + 1, $1, $3, $4, $5, $6,\n                       CASE WHEN count(*) = 0 THEN 'primary'\n                            WHEN bool_and(model = $3) THEN 'retry' ELSE 'fallback' END\n                FROM litellm_usage.attempt WHERE request_id=$2 RETURNING *\n            ",
+                """
+                WITH capacity AS (
+                    SELECT id FROM litellm_usage.control
+                    WHERE id=1 AND admitted AND pending+open_requests+unknown_attempts < $7 FOR UPDATE
+                ), inserted AS (
+                    INSERT INTO litellm_usage.attempt(id, request_id, ordinal, log_id, model, model_group,
+                                                      deployment_id, provider, kind)
+                    SELECT $1,$2,count(*)::integer+1,$1,$3,$4,$5,$6,
+                        CASE WHEN count(*)=0 THEN 'primary'
+                             WHEN bool_and(model=$3) THEN 'retry' ELSE 'fallback' END
+                    FROM litellm_usage.attempt WHERE request_id=$2
+                    HAVING EXISTS(SELECT 1 FROM capacity) RETURNING *
+                ), recovery AS (
+                    INSERT INTO litellm_usage.recovery(attempt_id) SELECT id FROM inserted RETURNING attempt_id
+                ), counted AS (
+                    UPDATE litellm_usage.control SET unknown_attempts=unknown_attempts+1
+                    WHERE id=1 AND EXISTS(SELECT 1 FROM recovery) RETURNING id
+                )
+                SELECT inserted.* FROM inserted CROSS JOIN counted
+                """,
                 attempt_id,
                 request.id,
                 model,
                 group,
                 deployment,
                 provider,
+                self.max_pending,
             )
-            await tx.execute_raw("INSERT INTO litellm_usage.recovery(attempt_id) VALUES($1)", attempt_id)
-            await tx.execute_raw("UPDATE litellm_usage.control SET unknown_attempts=unknown_attempts+1 WHERE id=1")
-            return ATTEMPTS.validate_python(rows)[0]
+            attempts = ATTEMPTS.validate_python(rows)
+            if not attempts:
+                raise RuntimeError("request journal closed or usage journal capacity exhausted; provider call refused")
+            return attempts[0]
 
     async def finish(self, request: RequestRow, attempt: AttemptRow, body: Attempt) -> Attempt:
         async with self.transaction() as tx:
@@ -257,17 +311,29 @@ class Store:
                 else incoming
             )
             version = previous.version + 1
+            event = self.event(request, completed, version)
             await tx.execute_raw(
-                "\n                UPDATE litellm_usage.attempt SET ended_at=$2::text::timestamptz, version=$3, usage_known=$4, body=$5::jsonb\n                WHERE id=$1\n            ",
+                """
+                WITH updated AS (
+                    UPDATE litellm_usage.attempt SET ended_at=$2::text::timestamptz,
+                        version=$3,usage_known=$4,body=$5::jsonb WHERE id=$1 RETURNING request_id
+                ), emitted AS (
+                    INSERT INTO litellm_usage.outbox(event_id,version,request_id,payload,digest)
+                    SELECT $6,$3,request_id,$7::jsonb,$8 FROM updated RETURNING id
+                )
+                UPDATE litellm_usage.control SET pending=pending+1,
+                    unknown_attempts=unknown_attempts-CASE WHEN $4 THEN 1 ELSE 0 END
+                WHERE id=1 AND EXISTS(SELECT 1 FROM emitted)
+                """,
                 attempt.id,
                 completed.endedAt.isoformat() if completed.endedAt is not None else None,
                 version,
                 completed.usage.state == "known",
                 completed.model_dump_json(),
+                event.eventId,
+                event.model_dump_json(),
+                event.digest,
             )
-            if completed.usage.state == "known":
-                await tx.execute_raw("UPDATE litellm_usage.control SET unknown_attempts=unknown_attempts-1 WHERE id=1")
-            await self.emit(tx, request, completed, version)
             return completed
 
     async def close(self, request: RequestRow, outcome: str) -> None:
@@ -283,12 +349,6 @@ class Store:
                 )
             )
             ended = datetime.now(UTC)
-            await tx.execute_raw(
-                "UPDATE litellm_usage.request SET closed_at=$2::timestamptz, outcome=$3 WHERE id=$1",
-                request.id,
-                ended.isoformat(),
-                outcome,
-            )
             body = Closed.model_validate(
                 MappingProxyType(
                     {
@@ -299,8 +359,26 @@ class Store:
                     }
                 )
             )
-            await tx.execute_raw("UPDATE litellm_usage.control SET open_requests=open_requests-1 WHERE id=1")
-            await self.emit(tx, request, body)
+            event = self.event(request, body)
+            await tx.execute_raw(
+                """
+                WITH closed AS (
+                    UPDATE litellm_usage.request SET closed_at=$2::text::timestamptz,outcome=$3
+                    WHERE id=$1 RETURNING id
+                ), emitted AS (
+                    INSERT INTO litellm_usage.outbox(event_id,version,request_id,payload,digest)
+                    SELECT $4,1,id,$5::jsonb,$6 FROM closed RETURNING id
+                )
+                UPDATE litellm_usage.control SET open_requests=open_requests-1,pending=pending+1
+                WHERE id=1 AND EXISTS(SELECT 1 FROM emitted)
+                """,
+                request.id,
+                ended.isoformat(),
+                outcome,
+                event.eventId,
+                event.model_dump_json(),
+                event.digest,
+            )
 
     async def claim(self) -> Sequence[Delivery]:
         async with self.transaction() as tx:
@@ -431,17 +509,28 @@ class Store:
                     logger.error("supplier evidence conflict request=%s attempt=%s", request.id, observed.attemptId)
                     return
             version = TypeAdapter(int).validate_python(previous["observation_version"]) + 1
-            await self.emit(tx, request, observed, version)
+            event = self.event(request, observed, version)
             await tx.execute_raw(
                 """
-                UPDATE litellm_usage.recovery SET observation=$2::jsonb, observation_version=$3,
-                    completed=$4 AND EXISTS(SELECT 1 FROM litellm_usage.attempt WHERE id=$1 AND usage_known)
-                WHERE attempt_id=$1
+                WITH updated AS (
+                    UPDATE litellm_usage.recovery SET observation=$2::jsonb, observation_version=$3,
+                        completed=$4 AND EXISTS(SELECT 1 FROM litellm_usage.attempt WHERE id=$1 AND usage_known)
+                    WHERE attempt_id=$1 RETURNING attempt_id
+                ), emitted AS (
+                    INSERT INTO litellm_usage.outbox(event_id,version,request_id,payload,digest)
+                    SELECT $5,$3,$6,$7::jsonb,$8 FROM updated RETURNING id
+                )
+                UPDATE litellm_usage.control SET pending=pending+1
+                WHERE id=1 AND EXISTS(SELECT 1 FROM emitted)
             """,
                 observed.attemptId,
                 observed.model_dump_json(),
                 version,
                 isinstance(observed.cost, KnownCost),
+                event.eventId,
+                request.id,
+                event.model_dump_json(),
+                event.digest,
             )
 
     async def recovery_candidates(self) -> Sequence[AttemptRow]:

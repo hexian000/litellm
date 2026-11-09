@@ -169,7 +169,7 @@ async def capability(request: Request) -> Mapping[str, str]:
     supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     if not token or not secrets.compare_digest(token, supplied):
         raise HTTPException(403, "Invalid usage service credential")
-    if _state.store is None or not await _state.store.check_version():
+    if _state.store is None:
         raise HTTPException(503, "Durable usage journal is unavailable")
     return MappingProxyType(
         {"protocol": PROTOCOL, "instanceId": _state.store.instance_id, "contractDigest": contract_digest()}

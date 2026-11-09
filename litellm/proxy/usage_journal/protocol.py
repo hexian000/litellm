@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from functools import cache
 from types import MappingProxyType
 from typing import Annotated, Literal
 
@@ -142,6 +143,7 @@ class UsageBatch(WireModel):
     events: Annotated[Sequence[UsageEvent], Field(min_length=1, max_length=100)]
 
 
+@cache
 def contract_digest() -> str:
     return hashlib.sha256(
         json.dumps(

@@ -790,9 +790,8 @@ async def test_reader_recreate_uses_datasource_override(monkeypatch):
         "postgresql://u:newtoken@h:5432/db", http_client=None
     )
 
-    assert captured_kwargs == {
-        "datasource": {"url": "postgresql://u:newtoken@h:5432/db"}
-    }
+    assert captured_kwargs["datasource"] == {"url": "postgresql://u:newtoken@h:5432/db"}
+    assert captured_kwargs["http"]["limits"].max_keepalive_connections == 20
 
 
 @pytest.mark.asyncio
