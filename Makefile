@@ -196,7 +196,7 @@ lint-type-discipline: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
 # --update lowers each limit by what this branch fixed since its branch point, so
 # it needs the base ref fetched to resolve the merge-base.
 lint-basedpyright-budget-update: install-dev lint-fetch-base
-	($(UV_RUN) basedpyright --outputjson || true) | $(UV_RUN) python scripts/type_check_gate.py --update
+	($(UV_RUN) basedpyright --outputjson || true) | $(UV_RUN) python scripts/type_check_gate.py --update --base $(LINT_BASE_REF)
 
 lint-format: format-check
 
@@ -209,10 +209,10 @@ lint-gate: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
 	$(UV_RUN) python scripts/ruff_strict_gate.py --base $(LINT_BASE_REF)
 
 lint-ruff-budget-update: install-dev lint-fetch-base
-	$(UV_RUN) python scripts/ruff_strict_gate.py --update
+	$(UV_RUN) python scripts/ruff_strict_gate.py --update --base $(LINT_BASE_REF)
 
 lint-type-discipline-budget-update: install-dev lint-fetch-base
-	$(UV_RUN) python scripts/type_discipline_gate.py --update
+	$(UV_RUN) python scripts/type_discipline_gate.py --update --base $(LINT_BASE_REF)
 
 # Ratchet all budgets in one shot (ruff strict + type-discipline + basedpyright)
 lint-budget-update: lint-ruff-budget-update lint-type-discipline-budget-update lint-basedpyright-budget-update

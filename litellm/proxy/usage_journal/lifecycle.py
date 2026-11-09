@@ -405,6 +405,40 @@ async def capture_spend(payload: object) -> None:
         logger.error("supplier evidence pending error=%s", type(error).__name__)
 
 
+async def capture_failure(details: object, started: datetime, ended: datetime, error: Exception) -> None:
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    from .evidence import metadata
+
+    try:
+        values = fields(details)
+        payload = get_logging_payload(
+            MappingProxyType(
+                {
+                    **values,
+                    "completion_start_time": values.get("completion_start_time") or ended,
+                    "response_cost": values.get("response_cost") or None,
+                }
+            ),
+            None,
+            started,
+            ended,
+        )
+        source = fields(payload)
+        await capture_spend(
+            MappingProxyType(
+                {
+                    **source,
+                    "metadata": MappingProxyType({**metadata(source), "usage_object": None}),
+                    "status": "failure",
+                    "status_code": getattr(error, "status_code", None),
+                }
+            )
+        )
+    except JOURNAL_ERRORS as failure:
+        logger.error("supplier failure evidence pending error=%s", type(failure).__name__)
+
+
 def owns_business_events() -> bool:
     handle = current_request.get()
     return handle is not None and handle.row.mode == "active"

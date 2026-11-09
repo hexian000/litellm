@@ -181,12 +181,13 @@ async def test_unknown_can_be_enriched_but_known_usage_is_not_overwritten(store:
         deploymentId=None,
         provider=None,
         startedAt=attempt.started_at,
-        endedAt=attempt.started_at,
-        outcome="failure",
+        endedAt=None,
+        outcome="unknown",
         usage=UnknownUsage(state="unknown", reason="process_lost"),
     )
     known = unknown.model_copy(
-        update={"usage": KnownUsage(state="known", promptTokens=1, completionTokens=2, cacheReadTokens=0)}
+        update={"usage": KnownUsage(state="known", promptTokens=1, completionTokens=2, cacheReadTokens=0),
+                "outcome": "success", "endedAt": attempt.started_at}
     )
     await store.finish(row, attempt, unknown)
     await store.finish(row, attempt, known)
@@ -321,6 +322,120 @@ async def test_closed_request_missing_attempt_is_recovered_from_durable_source(s
     }
 
 
+async def test_native_spend_capture_retains_source_before_log_delivery(store: Store) -> None:
+    from litellm.proxy.usage_journal.evidence import capture, recover_evidence
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    await capture(store, {
+        "request_id": attempt.log_id,
+        "endTime": attempt.started_at,
+        "prompt_tokens": 10,
+        "completion_tokens": 3,
+        "spend": 0,
+        "status": "success",
+        "call_type": "acompletion",
+        "metadata": json.dumps({
+            "usage_object": {"prompt_tokens": 10, "completion_tokens": 3},
+            "additional_usage_values": {"journal_cost_known": True},
+        }),
+    })
+    retained = await store.database.writer_db.query_raw(
+        "SELECT source_payload FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
+    )
+    assert retained[0]["source_payload"]["metadata"]["usage_object"]["prompt_tokens"] == 10
+    await store.close(row, "success")
+    await recover_evidence(store)
+    recovered = await store.database.writer_db.query_raw(
+        "SELECT completed,observation FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
+    )
+    assert recovered[0]["completed"] is True
+    assert recovered[0]["observation"]["cost"]["amount"] == "0.000000"
+
+
+async def test_supplier_failure_is_observed_without_inventing_usage(store: Store) -> None:
+    from litellm.proxy.usage_journal.evidence import apply_source
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    await store.close(row, "failure")
+    await apply_source(store, attempt, {
+        "request_id": attempt.log_id,
+        "endTime": attempt.started_at,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "spend": None,
+        "status": "failure",
+        "status_code": 503,
+        "call_type": "acompletion",
+    })
+    recovered = await store.database.writer_db.query_raw(
+        "SELECT completed,observation FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
+    )
+    assert recovered[0]["completed"] is False
+    assert recovered[0]["observation"]["outcome"] == "failure"
+    assert recovered[0]["observation"]["statusCode"] == 503
+    assert recovered[0]["observation"]["cost"]["state"] == "unknown"
+    usage = await store.database.writer_db.query_raw(
+        "SELECT usage_known,body FROM litellm_usage.attempt WHERE id=$1", attempt.id
+    )
+    assert usage[0]["usage_known"] is False
+    assert usage[0]["body"]["usage"]["state"] == "unknown"
+    await apply_source(store, attempt, {
+        "request_id": attempt.log_id,
+        "endTime": attempt.started_at,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "spend": None,
+        "status": "failure",
+        "status_code": 503,
+        "call_type": "acompletion",
+    })
+    assert await store.database.writer_db.query_raw(
+        "SELECT version FROM litellm_usage.outbox WHERE event_id=$1", f"{row.id}/attempt/{attempt.id}"
+    ) == [{"version": 1}]
+
+
+async def test_actual_client_failure_retains_attempt_source_before_context_unwinds(store: Store) -> None:
+    import litellm
+    from openai import AsyncOpenAI
+
+    from litellm.proxy.usage_journal.evidence import recover_evidence
+    from litellm.proxy.usage_journal.lifecycle import RequestHandle, configure, current_request
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"message": "unavailable", "type": "server_error"}})
+
+    row = await start(store)
+    token = current_request.set(RequestHandle(store, row))
+    configure(store)
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable)) as http_client:
+            async with AsyncOpenAI(api_key="sk-unit", max_retries=0, http_client=http_client) as client:
+                with pytest.raises(litellm.ServiceUnavailableError):
+                    await litellm.acompletion(
+                        model="openai/test-model", client=client, messages=[{"role": "user", "content": "hello"}]
+                    )
+    finally:
+        configure(None)
+        current_request.reset(token)
+    await store.close(row, "failure")
+    await recover_evidence(store)
+    source = await store.database.writer_db.query_raw(
+        "SELECT c.source_payload,c.observation,a.usage_known FROM litellm_usage.recovery c "
+        "JOIN litellm_usage.attempt a ON a.id=c.attempt_id WHERE a.request_id=$1", row.id
+    )
+    assert source[0]["source_payload"]["request_id"] == source[0]["observation"]["logId"]
+    assert source[0]["observation"]["outcome"] == "failure"
+    assert source[0]["observation"]["statusCode"] == 503
+    assert source[0]["observation"]["cost"]["state"] == "unknown"
+    assert source[0]["usage_known"] is False
+
+
 async def test_recovery_without_evidence_keeps_unknown_and_fences_old_owner(store: Store) -> None:
     from litellm.proxy.usage_journal.runtime import recover
 
@@ -356,6 +471,39 @@ async def test_recovery_claims_are_bounded_and_disjoint(store: Store) -> None:
     assert len(first) <= 100 and len(second) <= 100
     assert not {a.id for a in first} & {a.id for a in second}
     assert attempt.id in {a.id for a in (*first, *second)}
+
+
+async def test_recovery_resumes_after_takeover_without_closing_live_requests(store: Store) -> None:
+    from litellm.proxy.usage_journal.runtime import recover
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    await store.database.writer_db.execute_raw(
+        "UPDATE litellm_usage.request SET started_at=now()-interval '2 minutes' WHERE id=$1", row.id
+    )
+    other = Store(store.database, f"replacement-{uuid4()}")
+    await other.heartbeat(10 * 1024**3)
+    adopted = await other.orphaned()
+    assert row.id in {request.id for request in adopted}
+    live = await start(other)
+
+    await recover(other)
+
+    recovered = await store.database.writer_db.query_raw(
+        "SELECT closed_at,outcome FROM litellm_usage.request WHERE id=$1", row.id
+    )
+    assert recovered[0]["closed_at"] is not None
+    assert recovered[0]["outcome"] == "unknown"
+    pending = await store.database.writer_db.query_raw(
+        "SELECT usage_known,body FROM litellm_usage.attempt WHERE id=$1", attempt.id
+    )
+    assert pending[0]["usage_known"] is False
+    assert pending[0]["body"]["endedAt"] is None
+    assert await store.database.writer_db.query_raw(
+        "SELECT closed_at FROM litellm_usage.request WHERE id=$1", live.id
+    ) == [{"closed_at": None}]
 
 
 @pytest.mark.parametrize(

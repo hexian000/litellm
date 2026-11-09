@@ -222,6 +222,8 @@ class Store:
                 await tx.query_raw("SELECT * FROM litellm_usage.attempt WHERE id=$1 FOR UPDATE", attempt.id)
             )
             previous = rows[0]
+            if previous.body == body:
+                return
             if previous.usage_known:
                 if previous.body is not None and previous.body != body:
                     await tx.execute_raw("UPDATE litellm_usage.request SET conflicted=true WHERE id=$1", request.id)
@@ -231,7 +233,7 @@ class Store:
                 body = previous.body.model_copy(update=MappingProxyType({"usage": body.usage}))
             version = previous.version + 1
             await tx.execute_raw(
-                "\n                UPDATE litellm_usage.attempt SET ended_at=$2::timestamptz, version=$3, usage_known=$4, body=$5::jsonb\n                WHERE id=$1\n            ",
+                "\n                UPDATE litellm_usage.attempt SET ended_at=$2::text::timestamptz, version=$3, usage_known=$4, body=$5::jsonb\n                WHERE id=$1\n            ",
                 attempt.id,
                 body.endedAt.isoformat() if body.endedAt is not None else None,
                 version,
@@ -348,10 +350,14 @@ class Store:
                 WITH due AS (
                     SELECT r.id FROM litellm_usage.request r
                     LEFT JOIN litellm_usage.instance i ON i.id=r.instance_id
-                    WHERE r.closed_at IS NULL AND r.started_at < now()-interval '60 seconds'
-                      AND (i.heartbeat_at IS NULL OR i.heartbeat_at < now()-interval '60 seconds')
+                    WHERE r.closed_at IS NULL AND (
+                        (r.instance_id=$1 AND r.outcome='unknown') OR (
+                            r.started_at < now()-interval '60 seconds'
+                            AND (i.heartbeat_at IS NULL OR i.heartbeat_at < now()-interval '60 seconds')
+                        )
+                    )
                     ORDER BY r.started_at LIMIT 100 FOR UPDATE OF r SKIP LOCKED
-                ) UPDATE litellm_usage.request r SET instance_id=$1 FROM due
+                ) UPDATE litellm_usage.request r SET instance_id=$1, outcome='unknown' FROM due
                   WHERE r.id=due.id RETURNING r.*
             """,
                 self.instance_id,
@@ -466,7 +472,8 @@ class Store:
         return MappingProxyType({**found[0], "journal_stream": source.get("journal_stream") if source else None})
 
     async def retain_source(self, attempt: AttemptRow, payload: Mapping[str, object]) -> None:
-        encoded = TypeAdapter(Mapping[str, object]).dump_json(payload).decode()
+        codec = TypeAdapter(Mapping[str, object])
+        encoded = codec.dump_json(payload, fallback=codec.validate_python).decode()
         await self.database.writer_db.execute_raw(
             """
             UPDATE litellm_usage.recovery SET source_payload=$2::jsonb

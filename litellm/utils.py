@@ -1818,6 +1818,10 @@ def client(original_function):
                     raise e
 
             call_type = original_function.__name__
+            if usage_attempt is not None:
+                await usage_lifecycle.capture_failure(
+                    logging_obj.model_call_details if logging_obj is not None else kwargs, start_time, end_time, e
+                )
             num_retries, kwargs = _get_wrapper_num_retries(kwargs=kwargs, exception=e)
             if call_type == CallTypes.acompletion.value:
                 context_window_fallback_dict = kwargs.get("context_window_fallback_dict", {})

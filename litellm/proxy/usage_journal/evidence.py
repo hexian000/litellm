@@ -98,8 +98,9 @@ async def apply_source(store: Store, attempt: AttemptRow, payload: Mapping[str, 
                     )
                 )
         ended = moment(payload.get("endTime"))
-        if isinstance(reported, KnownUsage) and ended is not None and ended >= attempt.started_at:
-            status = payload.get("status")
+        status = payload.get("status")
+        failed = status in frozenset(("failure", "failed", "error"))
+        if (isinstance(reported, KnownUsage) or failed) and ended is not None and ended >= attempt.started_at:
             recovered = Attempt(
                 type="attempt.finished",
                 attemptId=attempt.id,
@@ -112,7 +113,7 @@ async def apply_source(store: Store, attempt: AttemptRow, payload: Mapping[str, 
                 provider=attempt.provider,
                 startedAt=attempt.started_at,
                 endedAt=ended,
-                outcome="failure" if status in frozenset(("failure", "failed", "error")) else "success",
+                outcome="failure" if failed else "success",
                 usage=reported,
                 supplierAttempted=True,
             )
