@@ -6,7 +6,7 @@ The canonical protocol belongs to the GuangRouter repository under `doc/contract
 
 ## Migration and activation
 
-Build the frozen head of PR #8 targeting `stable/gr-v1.96.2`. Prepare a traceable fork image using the dependency build workflow before ci-deploy consumes it. Do not build or patch LiteLLM on production hosts
+Build the frozen reviewed head of `stable/gr-v1.96.2`. Prepare a traceable fork image using the dependency build workflow before ci-deploy consumes it. Do not build or patch LiteLLM on production hosts
 
 First land the compatible GuangRouter receiver and drain every older accounting writer. Run this command with the existing LiteLLM database URL supplied through the deployment secret environment. The required database name is a target check. Omitting `--apply` is a preview
 
@@ -23,6 +23,10 @@ Set `LITELLM_USAGE_REPORT_URL` to the internal GuangRouter `/api/internal/litell
 Enable relay shadow reports first. Shadow events remain independent of customer accounting; compare their attempt/log identities, token counts and completion membership against spend logs. Only after A/B drain and comparison may the relay mark new requests `active`. Disabling the relay flag stops new protocol admissions while existing journals, callbacks and settlements continue draining
 
 ## Failure and resource boundaries
+
+Journal usage comes from supplier HTTP response bytes before SDK conversion. The default shared HTTP and OpenAI SDK clients capture JSON counts or terminal SSE usage without changing customer responses. SDK zero defaults, estimated stream counts and outgoing proxy chunks cannot prove supplier usage. Missing evidence stays unknown, including after a client disconnect. Supplier-declared zero counts remain known
+
+Streaming capture passes through the original bytes and recognizes identity, gzip and deflate encodings. Unsupported encodings and caller-supplied clients without the response hook leave usage unknown. Spend snapshots retain the captured usage and its cost provenance so recovery cannot promote SDK estimates or defaults. Older snapshots without supplier usage provenance remain unresolved rather than inventing a charge
 
 The active dispatch tick is 50 ms; empty polling exponentially backs off to one second. Each claim is ordered by its due-time index, and contains at most 100 events. HTTP runs outside database transactions. Claims expire after 30 seconds, permitting process or A/B takeover. Request identity uniqueness refuses provider replay, including after a crash. Lost processes produce unknown attempt evidence and a final membership declaration; they never recall a provider
 

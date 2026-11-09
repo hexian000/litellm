@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import ssl
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -26,7 +27,9 @@ import litellm
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.custom_httpx.http_handler import (
     _DEFAULT_TTL_FOR_HTTPX_CLIENTS,
+    JOURNAL_RESPONSE_HOOKS,
     AsyncHTTPHandler,
+    capture_journal_response,
     get_ssl_configuration,
 )
 
@@ -210,6 +213,9 @@ class BaseOpenAILLM:
 
         return httpx.AsyncClient(
             verify=ssl_config,
+            event_hooks=MappingProxyType(
+                {"response": JOURNAL_RESPONSE_HOOKS.validate_python((capture_journal_response,))}
+            ),
             transport=AsyncHTTPHandler._create_async_transport(
                 ssl_context=(ssl_config if isinstance(ssl_config, ssl.SSLContext) else None),
                 ssl_verify=ssl_config if isinstance(ssl_config, bool) else None,

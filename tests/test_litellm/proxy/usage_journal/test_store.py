@@ -4,8 +4,8 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -71,6 +71,252 @@ async def start(store: Store):
             mode="active",
         )
     )
+
+
+def supplier_metadata(prompt: int, completion: int) -> Mapping[str, object]:
+    return {
+        "additional_usage_values": {
+            "journal_usage": KnownUsage(
+                state="known", promptTokens=prompt, completionTokens=completion, cacheReadTokens=0
+            ).model_dump(),
+            "journal_cost_known": True,
+        }
+    }
+
+
+@asynccontextmanager
+async def supplier_api(body: bytes, content_type: str = "application/json", encoding: str = "") -> AsyncIterator[str]:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1"
+    finally:
+        import litellm
+        from openai import AsyncOpenAI
+
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        await asyncio.to_thread(thread.join)
+        cache = litellm.in_memory_llm_clients_cache
+        for key, client in tuple(cache.cache_dict.items()):
+            if isinstance(client, AsyncOpenAI) and str(client.base_url).startswith(
+                f"http://127.0.0.1:{server.server_port}/"
+            ):
+                await client.close()
+                cache.delete_cache(key)
+
+
+@pytest.mark.parametrize("reported", (None, (0, 0), (7, 1)))
+@pytest.mark.parametrize("overridden_factory", (False, True))
+async def test_supplier_http_usage_is_distinct_from_sdk_defaults(
+    store: Store, reported: tuple[int, int] | None, overridden_factory: bool
+) -> None:
+    import litellm
+    from aiohttp import ClientSession
+    from litellm.types.llms.custom_http import VerifyTypes
+    from openai import AsyncOpenAI
+    from typing_extensions import override
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from litellm.proxy.usage_journal.lifecycle import RequestHandle, close_request, current_request
+
+    class FactoryHandler(AsyncHTTPHandler):
+        @override
+        def create_client(
+            self,
+            timeout: float | httpx.Timeout | None,
+            event_hooks: Mapping[str, list[Callable[[httpx.Response], Awaitable[None]]]] | None,
+            ssl_verify: VerifyTypes | None = None,
+            shared_session: ClientSession | None = None,
+        ) -> httpx.AsyncClient:
+            return httpx.AsyncClient(event_hooks=event_hooks, timeout=timeout or 30, trust_env=False)
+
+    raw: dict[str, object] = {
+        "id": "chatcmpl-provider-usage",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "journal-provider-usage",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+        **(
+            {"usage": {"prompt_tokens": reported[0], "completion_tokens": reported[1], "total_tokens": sum(reported)}}
+            if reported is not None
+            else {}
+        ),
+    }
+    row = await start(store)
+    handle = RequestHandle(store, row)
+    token = current_request.set(handle)
+    try:
+        async with supplier_api(json.dumps(raw).encode()) as base:
+            if overridden_factory:
+                handler = FactoryHandler()
+                async with handler.client as http_client, AsyncOpenAI(
+                    api_key="local-fixture", base_url=base, http_client=http_client
+                ) as client:
+                    await litellm.acompletion(
+                        model="openai/journal-provider-usage", client=client, api_key="local-fixture",
+                        messages=[{"role": "user", "content": "ping"}], max_tokens=8,
+                    )
+            else:
+                await litellm.acompletion(
+                    model="openai/journal-provider-usage",
+                    api_base=base,
+                    api_key="local-fixture",
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=8,
+                )
+        await close_request(handle, "success")
+        assert len(handle.attempts) == 1
+        usage = handle.attempts[0].usage
+        assert isinstance(usage, KnownUsage) is (reported is not None)
+        if reported is not None:
+            assert isinstance(usage, KnownUsage)
+            assert (usage.promptTokens, usage.completionTokens) == reported
+    finally:
+        current_request.reset(token)
+
+
+@pytest.mark.parametrize("encoding", ("", "gzip"))
+@pytest.mark.parametrize("completed", (False, True))
+@pytest.mark.parametrize("reported", (None, (0, 0), (7, 1)))
+async def test_supplier_stream_requires_raw_terminal_usage(
+    store: Store, encoding: str, completed: bool, reported: tuple[int, int] | None
+) -> None:
+    import gzip
+
+    import litellm
+    from litellm.proxy.usage_journal.lifecycle import RequestHandle, close_request, current_request
+
+    common = {
+        "id": "chatcmpl-provider-stream",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "journal-provider-stream",
+    }
+    chunks = (
+        {**common, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "pong"}, "finish_reason": None}]},
+        {**common, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        *(
+            (
+                {
+                    **common,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": reported[0],
+                        "completion_tokens": reported[1],
+                        "total_tokens": sum(reported),
+                    },
+                },
+            )
+            if reported is not None
+            else ()
+        ),
+    )
+    body = (
+        "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + ("data: [DONE]\n\n" if completed else "")
+    ).encode()
+    payload = gzip.compress(body) if encoding else body
+    row = await start(store)
+    handle = RequestHandle(store, row)
+    token = current_request.set(handle)
+    try:
+        async with supplier_api(payload, "text/event-stream", encoding) as base:
+            response = await litellm.acompletion(
+                model="openai/journal-provider-stream",
+                api_base=base,
+                api_key="local-fixture",
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=8,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            async for _ in response:
+                pass
+        await close_request(
+            handle, "success", KnownUsage(state="known", promptTokens=11, completionTokens=1, cacheReadTokens=0)
+        )
+        usage = handle.attempts[0].usage
+        assert isinstance(usage, KnownUsage) is (completed and reported is not None)
+        if isinstance(usage, KnownUsage):
+            assert (usage.promptTokens, usage.completionTokens) == reported
+    finally:
+        current_request.reset(token)
+
+
+async def test_cancelled_stream_does_not_accept_estimated_outgoing_usage(store: Store) -> None:
+    from litellm.proxy.usage_journal.lifecycle import (
+        AttemptHandle,
+        RequestHandle,
+        close_request,
+    )
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    handle = RequestHandle(store, row, (AttemptHandle(attempt, streaming=True, called=True),))
+    await close_request(
+        handle, "cancelled", KnownUsage(state="known", promptTokens=11, completionTokens=1, cacheReadTokens=0)
+    )
+    stored = await store.database.writer_db.query_raw(
+        "SELECT usage_known,body FROM litellm_usage.attempt WHERE id=$1", attempt.id
+    )
+    assert stored[0]["usage_known"] is False
+    assert stored[0]["body"]["usage"]["state"] == "unknown"
+
+
+@pytest.mark.parametrize("provenance", (None, {"state": "unknown", "reason": "stream_interrupted"}))
+async def test_recovery_cannot_promote_sdk_estimates_to_supplier_evidence(store: Store, provenance) -> None:
+    from datetime import timedelta
+
+    from litellm.proxy.usage_journal.evidence import apply_source
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    await store.close(row, "cancelled")
+    await apply_source(
+        store,
+        attempt,
+        {
+            "request_id": attempt.log_id,
+            "endTime": (attempt.started_at + timedelta(seconds=1)).isoformat(),
+            "prompt_tokens": 11,
+            "completion_tokens": 1,
+            "spend": "0.000013",
+            "status": "success",
+            "call_type": "acompletion",
+            "metadata": {
+                "additional_usage_values": {
+                    "journal_usage": provenance,
+                    "journal_cost_known": False,
+                }
+            },
+        },
+    )
+    stored = await store.database.writer_db.query_raw(
+        "SELECT usage_known FROM litellm_usage.attempt WHERE id=$1", attempt.id
+    )
+    assert stored == [{"usage_known": False}]
 
 
 async def test_replay_refused_before_provider_can_be_called(store: Store) -> None:
@@ -446,7 +692,7 @@ def test_anthropic_stream_needs_terminal_evidence_and_merges_usage() -> None:
     assert wire.result() == KnownUsage(state="known", promptTokens=15, completionTokens=7, cacheReadTokens=5)
 
 
-async def test_actual_async_client_lifecycle_writes_attempt_and_closed_membership(store: Store, monkeypatch) -> None:
+async def test_async_client_lifecycle_writes_attempt_and_closed_membership(store: Store, monkeypatch) -> None:
     import litellm
     from starlette.requests import Request
     from litellm.proxy.usage_journal.lifecycle import configure, durable_request
@@ -494,7 +740,7 @@ async def test_actual_async_client_lifecycle_writes_attempt_and_closed_membershi
     batch = UsageBatch.model_validate({"events": [item["payload"] for item in events]})
     assert [e.body.type for e in batch.events] == ["request.started", "attempt.finished", "request.closed"]
     assert isinstance(batch.events[1].body, Attempt)
-    assert batch.events[1].body.usage.state == "known"
+    assert batch.events[1].body.usage.state == "unknown"
     assert batch.events[2].body.attemptIds == [batch.events[1].body.attemptId]
 
 
@@ -519,6 +765,7 @@ async def test_closed_request_missing_attempt_is_recovered_from_durable_source(s
             "prompt_tokens": 10,
             "completion_tokens": 3,
             "model_id": "deployment",
+            "metadata": supplier_metadata(10, 3),
             "spend": "0.000123",
             "status": "success",
             "call_type": "acompletion",
@@ -578,6 +825,7 @@ async def test_stale_native_source_preserves_the_first_committed_completion(stor
         "endTime": (attempt.started_at + timedelta(milliseconds=1)).isoformat(),
         "prompt_tokens": 7,
         "completion_tokens": 1,
+        "metadata": supplier_metadata(7, 1),
         "spend": "0.000009",
         "status": "success",
         "call_type": "acompletion",
@@ -650,6 +898,7 @@ async def test_stale_native_source_retains_contradictory_known_usage(store: Stor
             "endTime": (attempt.started_at + timedelta(milliseconds=1)).isoformat(),
             "prompt_tokens": 8,
             "completion_tokens": 1,
+            "metadata": supplier_metadata(8, 1),
             "spend": "0.000009",
             "status": "success",
             "call_type": "acompletion",
@@ -728,6 +977,7 @@ async def test_native_observation_accepts_prisma_millisecond_precision(store: St
         "endTime": (attempt.started_at + timedelta(seconds=1)).isoformat(),
         "prompt_tokens": 7,
         "completion_tokens": 1,
+        "metadata": supplier_metadata(7, 1),
         "spend": "0.000009",
         "status": "success",
         "call_type": "acompletion",
@@ -761,6 +1011,7 @@ async def test_native_observation_preserves_real_supplier_conflicts(store: Store
         "endTime": (attempt.started_at + timedelta(seconds=1)).isoformat(),
         "prompt_tokens": 7,
         "completion_tokens": 1,
+        "metadata": supplier_metadata(7, 1),
         "spend": "0.000009",
         "status": "success",
         "call_type": "acompletion",
@@ -790,19 +1041,24 @@ async def test_native_spend_capture_retains_source_before_log_delivery(store: St
     attempt = await store.begin_attempt(
         row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
     )
-    await capture(store, {
-        "request_id": attempt.log_id,
-        "endTime": attempt.started_at,
-        "prompt_tokens": 10,
-        "completion_tokens": 3,
-        "spend": 0,
-        "status": "success",
-        "call_type": "acompletion",
-        "metadata": json.dumps({
-            "usage_object": {"prompt_tokens": 10, "completion_tokens": 3},
-            "additional_usage_values": {"journal_cost_known": True},
-        }),
-    })
+    await capture(
+        store,
+        {
+            "request_id": attempt.log_id,
+            "endTime": attempt.started_at,
+            "prompt_tokens": 10,
+            "completion_tokens": 3,
+            "spend": 0,
+            "status": "success",
+            "call_type": "acompletion",
+            "metadata": json.dumps(
+                {
+                    "usage_object": {"prompt_tokens": 10, "completion_tokens": 3},
+                    **supplier_metadata(10, 3),
+                }
+            ),
+        },
+    )
     retained = await store.database.writer_db.query_raw(
         "SELECT source_payload FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
     )
@@ -999,6 +1255,23 @@ def test_stream_usage_needs_completion_and_accepts_fragmented_crlf():
     assert wire.result() == KnownUsage(state="known", promptTokens=10, completionTokens=2, cacheReadTokens=0)
 
 
+def test_supplier_error_cannot_make_partial_usage_terminal() -> None:
+    wire = WireUsage()
+    wire.feed('data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n')
+    wire.feed('data: {"type":"error","error":{"type":"api_error"}}\n\n')
+    wire.feed('data: [DONE]\n\n')
+    assert isinstance(wire.result(), UnknownUsage)
+
+
+@pytest.mark.parametrize("frame", ("data: broken-json\n\n", "data: " + "x" * 1048577 + "\n\n"))
+def test_supplier_corrupt_frame_cannot_make_partial_usage_terminal(frame: str) -> None:
+    wire = WireUsage()
+    wire.feed('data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n')
+    wire.feed(frame)
+    wire.feed("data: [DONE]\n\n")
+    assert isinstance(wire.result(), UnknownUsage)
+
+
 async def test_delivery_loss_and_partial_ack_leave_only_missing_events_pending(store):
     row = await start(store)
     await store.close(row, "success")
@@ -1168,7 +1441,7 @@ def test_admission_rejects_missing_or_mismatched_contract(digest, monkeypatch):
     assert failed.value.status_code == 409
 
 
-@pytest.mark.parametrize("cost,proven,known", [(None, False, False), (0, False, False), (0, None, False), (0, True, True), ("0.125", None, True)])
+@pytest.mark.parametrize("cost,proven,known", [(None, False, False), (0, False, False), (0, None, False), (0, True, True), ("0.125", None, True), ("0.125", False, False)])
 def test_missing_cost_defaults_cannot_become_proven_zero(cost, proven, known):
     from litellm.proxy.usage_journal.evidence import cost_from
     from litellm.proxy.usage_journal.protocol import KnownCost

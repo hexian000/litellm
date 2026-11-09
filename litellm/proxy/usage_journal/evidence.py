@@ -6,8 +6,10 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from types import MappingProxyType
 
-from .lifecycle import JOURNAL_ERRORS, OBJECTS, fields, usage_from
-from .protocol import Attempt, KnownCost, KnownUsage, Observation, UnknownCost
+from pydantic import TypeAdapter, ValidationError
+
+from .lifecycle import JOURNAL_ERRORS, OBJECTS, fields
+from .protocol import Attempt, KnownCost, KnownUsage, Observation, UnknownCost, UnknownUsage
 from .store import ATTEMPTS, AttemptRow, Store
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,8 @@ def metadata(payload: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def cost_from(payload: Mapping[str, object]) -> KnownCost | UnknownCost:
+    if fields(metadata(payload).get("additional_usage_values")).get("journal_cost_known") is False:
+        return UnknownCost(state="unknown", reason="supplier_cost_unproven")
     raw = payload.get("spend")
     if raw is None or isinstance(raw, bool):
         return UnknownCost(state="unknown", reason="supplier_cost_missing")
@@ -79,24 +83,12 @@ async def apply_source(store: Store, attempt: AttemptRow, payload: Mapping[str, 
     body = attempt.body
     if not attempt.usage_known and request.closed_at is not None:
         meta = metadata(payload)
-        reported = usage_from(MappingProxyType({"usage": meta.get("usage_object")}))
-        if not isinstance(reported, KnownUsage):
-            prompt, completion = payload.get("prompt_tokens"), payload.get("completion_tokens")
-            cached = fields(meta.get("additional_usage_values")).get("cache_read_input_tokens", 0)
-            if isinstance(prompt, int) and isinstance(completion, int) and prompt + completion > 0:
-                reported = usage_from(
-                    MappingProxyType(
-                        {
-                            "usage": MappingProxyType(
-                                {
-                                    "prompt_tokens": prompt,
-                                    "completion_tokens": completion,
-                                    "prompt_tokens_details": MappingProxyType({"cached_tokens": cached}),
-                                }
-                            )
-                        }
-                    )
-                )
+        try:
+            reported = TypeAdapter(KnownUsage | UnknownUsage).validate_python(
+                fields(meta.get("additional_usage_values")).get("journal_usage")
+            )
+        except ValidationError:
+            reported = UnknownUsage(state="unknown", reason="supplier_usage_unproven")
         ended = moment(payload.get("endTime"))
         status = payload.get("status")
         failed = status in frozenset(("failure", "failed", "error"))

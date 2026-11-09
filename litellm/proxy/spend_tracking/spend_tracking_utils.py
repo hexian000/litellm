@@ -405,7 +405,12 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
 
     journal_attempt = current_attempt.get() or stream_attempt.get()
     if journal_attempt is not None:
-        additional_usage_values["journal_cost_known"] = kwargs.get("response_cost") is not None
+        from litellm.proxy.usage_journal.protocol import KnownUsage
+
+        additional_usage_values["journal_usage"] = journal_attempt.supplier_usage.model_dump()
+        additional_usage_values["journal_cost_known"] = kwargs.get("response_cost") is not None and (
+            not journal_attempt.called or isinstance(journal_attempt.supplier_usage, KnownUsage)
+        )
     if cache_hit is True and journal_attempt is None:
         import time
 
