@@ -36,9 +36,22 @@ def fields(value: object) -> Mapping[str, object]:
 
 
 def usage_from(value: object) -> KnownUsage | UnknownUsage:
-    usage = fields(fields(value).get("usage"))
+    response = fields(value)
+    usage = fields(response.get("usage"))
     if "prompt_tokens" in usage and "completion_tokens" in usage:
         prompt, completion = (usage["prompt_tokens"], usage["completion_tokens"])
+        cached = fields(usage.get("prompt_tokens_details")).get("cached_tokens", 0)
+    elif (
+        "prompt_tokens" in usage
+        and response.get("object") == "list"
+        and isinstance(response.get("data"), Sequence)
+        and response.get("data")
+        and all(
+            fields(item).get("object") == "embedding"
+            for item in TypeAdapter(Sequence[object]).validate_python(response["data"])
+        )
+    ):
+        prompt, completion = usage["prompt_tokens"], 0
         cached = fields(usage.get("prompt_tokens_details")).get("cached_tokens", 0)
     elif "input_tokens" in usage and "output_tokens" in usage:
         cached = usage.get("cache_read_input_tokens", fields(usage.get("input_tokens_details")).get("cached_tokens", 0))
@@ -49,7 +62,7 @@ def usage_from(value: object) -> KnownUsage | UnknownUsage:
             if isinstance(input_count, int)
             and isinstance(creation, int)
             and isinstance(cached, int)
-            and ("cache_read_input_tokens" in usage)
+            and ("cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage)
             else input_count
         )
         completion = usage["output_tokens"]
@@ -89,7 +102,7 @@ class AttemptHandle:
     outcome: str = "failure"
     streaming: bool = False
     persisted: bool = False
-    called: bool = False
+    called: bool | None = False
     body: Attempt | None = None
 
 
@@ -145,9 +158,10 @@ async def persist(handle: RequestHandle, attempt: AttemptHandle) -> None:
                 "deploymentId": attempt.row.deployment_id,
                 "provider": attempt.row.provider,
                 "startedAt": attempt.row.started_at,
-                "endedAt": datetime.now(UTC),
+                "endedAt": None if attempt.outcome == "unknown" else datetime.now(UTC),
                 "outcome": attempt.outcome,
                 "usage": attempt.usage.model_dump(),
+                "supplierAttempted": attempt.called,
             }
         )
     )
@@ -204,7 +218,15 @@ async def end_attempt(attempt: AttemptHandle | None, token: Token[AttemptHandle 
         if result is None and (not attempt.called)
         else usage_from(result)
     )
-    attempt.outcome = "success" if result is not None else "failure"
+    attempt.outcome = (
+        "cache_hit"
+        if result is not None and not attempt.called
+        else "success"
+        if result is not None
+        else "unknown"
+        if attempt.called
+        else "failure"
+    )
     try:
         await persist(handle, attempt)
     except JOURNAL_ERRORS as error:
@@ -256,7 +278,7 @@ class WireUsage:
 
     def feed(self, chunk: str | bytes) -> None:
         text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
-        self.buffer += text
+        self.buffer = (self.buffer + text).replace("\r\n", "\n")
         if len(self.buffer) > 1048576:
             self.buffer = ""
             return
@@ -272,29 +294,32 @@ class WireUsage:
                 payload = OBJECTS.validate_json(data)
             except (ValueError, ValidationError):
                 continue
-            kind = payload.get("type")
-            if kind == "error" or payload.get("error"):
-                self.failed = True
-            if kind == "message_start":
-                self.anthropic = True
-                self.usage = MappingProxyType(
-                    MappingProxyType({**self.usage, **fields(fields(payload.get("message")).get("usage"))})
-                )
-            elif kind == "message_delta":
-                self.usage = MappingProxyType(MappingProxyType({**self.usage, **fields(payload.get("usage"))}))
-            elif kind == "message_stop":
-                self.complete = True
-            elif kind == "response.completed":
-                self.usage = MappingProxyType(
-                    MappingProxyType({**self.usage, **fields(fields(payload.get("response")).get("usage"))})
-                )
-                self.complete = True
-            elif payload.get("usage"):
-                self.usage = MappingProxyType(MappingProxyType({**self.usage, **fields(payload.get("usage"))}))
+            self._payload(payload)
+
+    def _payload(self, payload: Mapping[str, object]) -> None:
+        kind = payload.get("type")
+        if kind == "error" or payload.get("error"):
+            self.failed = True
+        if kind == "message_start":
+            self.anthropic = True
+            self.usage = MappingProxyType(
+                MappingProxyType({**self.usage, **fields(fields(payload.get("message")).get("usage"))})
+            )
+        elif kind == "message_delta":
+            self.usage = MappingProxyType(MappingProxyType({**self.usage, **fields(payload.get("usage"))}))
+        elif kind == "message_stop":
+            self.complete = True
+        elif kind == "response.completed":
+            self.usage = MappingProxyType(
+                MappingProxyType({**self.usage, **fields(fields(payload.get("response")).get("usage"))})
+            )
+            self.complete = True
+        elif payload.get("usage"):
+            self.usage = MappingProxyType(MappingProxyType({**self.usage, **fields(payload.get("usage"))}))
 
     def result(self) -> KnownUsage | UnknownUsage:
-        if self.anthropic and (not self.complete):
-            return UnknownUsage(state="unknown", reason="anthropic_stream_interrupted")
+        if not self.complete:
+            return UnknownUsage(state="unknown", reason="stream_interrupted")
         return usage_from(MappingProxyType({"usage": self.usage}))
 
 
@@ -310,7 +335,7 @@ async def body_stream(
             value = chunk.tobytes() if isinstance(chunk, memoryview) else chunk
             wire.feed(value)
             yield value
-        outcome = "failure" if wire.failed else "success"
+        outcome = "failure" if wire.failed else "success" if wire.complete else "unknown"
     finally:
         try:
             await asyncio.shield(close_request(handle, outcome, wire.result()))
@@ -363,3 +388,23 @@ def durable_request(function: Callable[P, Awaitable[R]]) -> Callable[P, Awaitabl
             current_request.reset(token)
 
     return wrapper
+
+
+async def capture_spend(payload: object) -> None:
+    if _state.store is None:
+        return
+    from .evidence import capture
+
+    try:
+        attempt = current_attempt.get() or stream_attempt.get()
+        await capture(
+            _state.store,
+            MappingProxyType({**fields(payload), "journal_stream": attempt.streaming if attempt is not None else None}),
+        )
+    except JOURNAL_ERRORS as error:
+        logger.error("supplier evidence pending error=%s", type(error).__name__)
+
+
+def owns_business_events() -> bool:
+    handle = current_request.get()
+    return handle is not None and handle.row.mode == "active"

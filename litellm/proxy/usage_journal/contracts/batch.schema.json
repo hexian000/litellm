@@ -82,16 +82,24 @@
           "type": "string"
         },
         "endedAt": {
-          "format": "date-time",
-          "title": "Endedat",
-          "type": "string"
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Endedat"
         },
         "outcome": {
           "enum": [
             "success",
             "failure",
             "cancelled",
-            "cache_hit"
+            "cache_hit",
+            "unknown"
           ],
           "title": "Outcome",
           "type": "string"
@@ -113,6 +121,18 @@
             }
           ],
           "title": "Usage"
+        },
+        "supplierAttempted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supplierattempted"
         }
       },
       "required": [
@@ -150,7 +170,8 @@
           "enum": [
             "success",
             "failure",
-            "cancelled"
+            "cancelled",
+            "unknown"
           ],
           "title": "Outcome",
           "type": "string"
@@ -174,6 +195,42 @@
         "attemptIds"
       ],
       "title": "Closed",
+      "type": "object"
+    },
+    "KnownCost": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "known",
+          "title": "State",
+          "type": "string"
+        },
+        "amount": {
+          "pattern": "^(?:0|[1-9][0-9]{0,11})(?:\\.[0-9]{1,6})?$",
+          "title": "Amount",
+          "type": "string"
+        },
+        "currency": {
+          "const": "USD",
+          "default": "USD",
+          "title": "Currency",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "spend_log",
+            "logging_payload"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "amount",
+        "source"
+      ],
+      "title": "KnownCost",
       "type": "object"
     },
     "KnownUsage": {
@@ -212,6 +269,159 @@
       "title": "KnownUsage",
       "type": "object"
     },
+    "Observation": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "attempt.observed",
+          "title": "Type",
+          "type": "string"
+        },
+        "attemptId": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/-]+$",
+          "title": "Attemptid",
+          "type": "string"
+        },
+        "logId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Logid",
+          "type": "string"
+        },
+        "deploymentId": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Deploymentid"
+        },
+        "providerModelId": {
+          "anyOf": [
+            {
+              "maxLength": 191,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Providermodelid"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "title": "Startedat",
+          "type": "string"
+        },
+        "endedAt": {
+          "format": "date-time",
+          "title": "Endedat",
+          "type": "string"
+        },
+        "firstResponseAt": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Firstresponseat"
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "cache_hit"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "statusCode": {
+          "anyOf": [
+            {
+              "maximum": 599,
+              "minimum": 100,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Statuscode"
+        },
+        "supplierAttempted": {
+          "title": "Supplierattempted",
+          "type": "boolean"
+        },
+        "requestType": {
+          "maxLength": 48,
+          "minLength": 1,
+          "title": "Requesttype",
+          "type": "string"
+        },
+        "stream": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stream"
+        },
+        "cost": {
+          "discriminator": {
+            "mapping": {
+              "known": "#/$defs/KnownCost",
+              "unknown": "#/$defs/UnknownCost"
+            },
+            "propertyName": "state"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/KnownCost"
+            },
+            {
+              "$ref": "#/$defs/UnknownCost"
+            }
+          ],
+          "title": "Cost"
+        }
+      },
+      "required": [
+        "type",
+        "attemptId",
+        "logId",
+        "deploymentId",
+        "startedAt",
+        "endedAt",
+        "outcome",
+        "supplierAttempted",
+        "requestType",
+        "stream",
+        "cost"
+      ],
+      "title": "Observation",
+      "type": "object"
+    },
     "Started": {
       "additionalProperties": false,
       "properties": {
@@ -231,6 +441,28 @@
         "startedAt"
       ],
       "title": "Started",
+      "type": "object"
+    },
+    "UnknownCost": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "const": "unknown",
+          "title": "State",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "reason"
+      ],
+      "title": "UnknownCost",
       "type": "object"
     },
     "UnknownUsage": {
@@ -325,6 +557,7 @@
           "discriminator": {
             "mapping": {
               "attempt.finished": "#/$defs/Attempt",
+              "attempt.observed": "#/$defs/Observation",
               "request.closed": "#/$defs/Closed",
               "request.started": "#/$defs/Started"
             },
@@ -339,6 +572,9 @@
             },
             {
               "$ref": "#/$defs/Closed"
+            },
+            {
+              "$ref": "#/$defs/Observation"
             }
           ],
           "title": "Body"

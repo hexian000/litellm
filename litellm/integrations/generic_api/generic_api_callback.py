@@ -284,6 +284,11 @@ class GenericAPILogger(CustomBatchLogger):
             Raises a NON Blocking verbose_logger.exception if an error occurs
         """
 
+        from litellm.proxy.usage_journal.lifecycle import owns_business_events
+
+        if self.callback_name == "workbench_model_control" and owns_business_events():
+            return
+
         if self.event_types is not None and "llm_api_success" not in self.event_types:
             return
 
@@ -317,6 +322,11 @@ class GenericAPILogger(CustomBatchLogger):
         - Creates a StandardLoggingPayload
         - Adds to batch queue
         """
+        from litellm.proxy.usage_journal.lifecycle import owns_business_events
+
+        if self.callback_name == "workbench_model_control" and owns_business_events():
+            return
+
         if self.event_types is not None and "llm_api_failure" not in self.event_types:
             return
 

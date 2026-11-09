@@ -1,0 +1,3 @@
+CREATE TABLE litellm_usage.feature_revision (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now(), operation_id text NOT NULL);
+CREATE TABLE litellm_usage.recovery (attempt_id text PRIMARY KEY REFERENCES litellm_usage.attempt(id), next_at timestamptz NOT NULL DEFAULT now(), lease_owner text, lease_until timestamptz, attempts integer NOT NULL DEFAULT 0, completed boolean NOT NULL DEFAULT false, observation_version integer NOT NULL DEFAULT 0, observation jsonb, source_payload jsonb);
+CREATE INDEX usage_recovery_due ON litellm_usage.recovery(next_at, attempt_id) WHERE NOT completed;

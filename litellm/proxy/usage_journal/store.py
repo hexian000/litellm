@@ -5,11 +5,11 @@ from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, TypeAdapter
 
-from .protocol import PROTOCOL, Attempt, Closed, Started, UsageEvent
+from .protocol import PROTOCOL, Attempt, Closed, KnownCost, Observation, Started, UsageEvent
 
 logger = logging.getLogger(__name__)
 Scalar = str | int | bool | None
@@ -62,7 +62,7 @@ class AttemptRow(BaseModel):
     model_group: str
     deployment_id: str | None = None
     provider: str | None = None
-    kind: str
+    kind: Literal["primary", "retry", "fallback"]
     started_at: datetime
     version: int = 0
     usage_known: bool = False
@@ -102,10 +102,28 @@ class Store:
 
     async def check_version(self) -> bool:
         rows = await self.database.writer_db.query_raw("SELECT version FROM litellm_usage.revision")
-        return tuple(row["version"] for row in TypeAdapter(Sequence[Mapping[str, int]]).validate_python(rows)) == (1,)
+        if tuple(row["version"] for row in TypeAdapter(Sequence[Mapping[str, int]]).validate_python(rows)) != (1,):
+            return False
+        feature = await self.database.writer_db.query_raw(
+            "SELECT to_regclass('litellm_usage.feature_revision')::text AS name"
+        )
+        if not TypeAdapter(Sequence[Mapping[str, str | None]]).validate_python(feature)[0]["name"]:
+            return False
+        versions = await self.database.writer_db.query_raw("SELECT version FROM litellm_usage.feature_revision")
+        return tuple(row["version"] for row in TypeAdapter(Sequence[Mapping[str, int]]).validate_python(versions)) == (
+            2,
+        )
 
-    async def emit(self, tx: Sql, request: RequestRow, body: Started | Attempt | Closed, version: int = 1) -> None:
-        suffix = f"attempt/{body.attemptId}" if isinstance(body, Attempt) else body.type.removeprefix("request.")
+    async def emit(
+        self, tx: Sql, request: RequestRow, body: Started | Attempt | Closed | Observation, version: int = 1
+    ) -> None:
+        suffix = (
+            f"attempt/{body.attemptId}"
+            if isinstance(body, Attempt)
+            else f"observation/{body.attemptId}"
+            if isinstance(body, Observation)
+            else body.type.removeprefix("request.")
+        )
         now = datetime.now(UTC)
         parsed = UsageEvent.model_validate(
             MappingProxyType(
@@ -173,7 +191,9 @@ class Store:
     ) -> AttemptRow:
         async with self.transaction() as tx:
             open_rows = await tx.query_raw(
-                "SELECT id FROM litellm_usage.request WHERE id=$1 AND closed_at IS NULL FOR UPDATE", request.id
+                "SELECT id FROM litellm_usage.request WHERE id=$1 AND closed_at IS NULL AND instance_id=$2 FOR UPDATE",
+                request.id,
+                self.instance_id,
             )
             if not open_rows:
                 raise RuntimeError("request journal closed; provider call refused")
@@ -192,6 +212,7 @@ class Store:
                 deployment,
                 provider,
             )
+            await tx.execute_raw("INSERT INTO litellm_usage.recovery(attempt_id) VALUES($1)", attempt_id)
             await tx.execute_raw("UPDATE litellm_usage.control SET unknown_attempts=unknown_attempts+1 WHERE id=1")
             return ATTEMPTS.validate_python(rows)[0]
 
@@ -206,13 +227,13 @@ class Store:
                     await tx.execute_raw("UPDATE litellm_usage.request SET conflicted=true WHERE id=$1", request.id)
                     await self.emit(tx, request, body, previous.version + 1)
                 return
-            if previous.body is not None:
+            if previous.body is not None and previous.body.outcome != "unknown":
                 body = previous.body.model_copy(update=MappingProxyType({"usage": body.usage}))
             version = previous.version + 1
             await tx.execute_raw(
                 "\n                UPDATE litellm_usage.attempt SET ended_at=$2::timestamptz, version=$3, usage_known=$4, body=$5::jsonb\n                WHERE id=$1\n            ",
                 attempt.id,
-                body.endedAt.isoformat(),
+                body.endedAt.isoformat() if body.endedAt is not None else None,
                 version,
                 body.usage.state == "known",
                 body.model_dump_json(),
@@ -226,7 +247,7 @@ class Store:
             rows = REQUESTS.validate_python(
                 await tx.query_raw("SELECT * FROM litellm_usage.request WHERE id=$1 FOR UPDATE", request.id)
             )
-            if rows[0].closed_at is not None:
+            if rows[0].closed_at is not None or rows[0].instance_id != self.instance_id:
                 return
             attempts = ATTEMPTS.validate_python(
                 await tx.query_raw(
@@ -256,7 +277,7 @@ class Store:
     async def claim(self) -> Sequence[Delivery]:
         async with self.transaction() as tx:
             rows = await tx.query_raw(
-                "\n                WITH due AS (SELECT id FROM litellm_usage.outbox\n                    WHERE disposition='pending' AND next_attempt_at <= now()\n                      AND (lease_until IS NULL OR lease_until < now())\n                    ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 100)\n                UPDATE litellm_usage.outbox o SET lease_owner=$1, lease_until=now()+interval '30 seconds'\n                FROM due WHERE o.id=due.id RETURNING o.id, o.payload, o.attempts\n            ",
+                "\n                WITH due AS (SELECT id FROM litellm_usage.outbox\n                    WHERE disposition='pending' AND next_attempt_at <= now()\n                      AND (lease_until IS NULL OR lease_until < now())\n                    ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 100)\n                UPDATE litellm_usage.outbox o SET lease_owner=$1, lease_until=now()+interval '30 seconds'\n                FROM due WHERE o.id=due.id RETURNING o.id, o.payload, o.attempts\n            ",
                 self.instance_id,
             )
             return DELIVERIES.validate_python(rows)
@@ -313,7 +334,7 @@ class Store:
                 self.instance_id,
             )
             await tx.execute_raw(
-                "\n                UPDATE litellm_usage.control SET admitted=(\n                    pg_total_relation_size('litellm_usage.outbox') + pg_total_relation_size('litellm_usage.attempt')\n                    + pg_total_relation_size('litellm_usage.request') < $1) WHERE id=1\n            ",
+                "\n                UPDATE litellm_usage.control SET admitted=(\n                    pg_total_relation_size('litellm_usage.outbox') + pg_total_relation_size('litellm_usage.attempt')\n                    + pg_total_relation_size('litellm_usage.request') + pg_total_relation_size('litellm_usage.recovery') < $1) WHERE id=1\n            ",
                 max_bytes,
             )
             await tx.execute_raw(
@@ -321,7 +342,136 @@ class Store:
             )
 
     async def orphaned(self) -> Sequence[RequestRow]:
+        async with self.transaction() as tx:
+            rows = await tx.query_raw(
+                """
+                WITH due AS (
+                    SELECT r.id FROM litellm_usage.request r
+                    LEFT JOIN litellm_usage.instance i ON i.id=r.instance_id
+                    WHERE r.closed_at IS NULL AND r.started_at < now()-interval '60 seconds'
+                      AND (i.heartbeat_at IS NULL OR i.heartbeat_at < now()-interval '60 seconds')
+                    ORDER BY r.started_at LIMIT 100 FOR UPDATE OF r SKIP LOCKED
+                ) UPDATE litellm_usage.request r SET instance_id=$1 FROM due
+                  WHERE r.id=due.id RETURNING r.*
+            """,
+                self.instance_id,
+            )
+            return REQUESTS.validate_python(rows)
+
+    async def observe(self, request: RequestRow, body: Observation) -> None:
+        async with self.transaction() as tx:
+            rows = await tx.query_raw(
+                """
+                SELECT observation, observation_version FROM litellm_usage.recovery
+                WHERE attempt_id=$1 FOR UPDATE
+            """,
+                body.attemptId,
+            )
+            previous = TypeAdapter(Sequence[Mapping[str, object]]).validate_python(rows)[0]
+            if previous["observation"] is not None:
+                prior = Observation.model_validate(previous["observation"])
+                if prior == body:
+                    await tx.execute_raw(
+                        """
+                        UPDATE litellm_usage.recovery SET completed=$2 AND EXISTS(
+                            SELECT 1 FROM litellm_usage.attempt WHERE id=$1 AND usage_known)
+                        WHERE attempt_id=$1
+                    """,
+                        body.attemptId,
+                        isinstance(body.cost, KnownCost),
+                    )
+                    return
+                if (
+                    isinstance(prior.cost, KnownCost)
+                    or prior.model_copy(update=MappingProxyType({"cost": body.cost})) != body
+                ):
+                    await tx.execute_raw("UPDATE litellm_usage.request SET conflicted=true WHERE id=$1", request.id)
+                    version = TypeAdapter(int).validate_python(previous["observation_version"]) + 1
+                    await self.emit(tx, request, body, version)
+                    await tx.execute_raw(
+                        """
+                        UPDATE litellm_usage.recovery SET observation_version=$2,completed=true WHERE attempt_id=$1
+                    """,
+                        body.attemptId,
+                        version,
+                    )
+                    logger.error("supplier evidence conflict request=%s attempt=%s", request.id, body.attemptId)
+                    return
+            version = TypeAdapter(int).validate_python(previous["observation_version"]) + 1
+            await self.emit(tx, request, body, version)
+            await tx.execute_raw(
+                """
+                UPDATE litellm_usage.recovery SET observation=$2::jsonb, observation_version=$3,
+                    completed=$4 AND EXISTS(SELECT 1 FROM litellm_usage.attempt WHERE id=$1 AND usage_known)
+                WHERE attempt_id=$1
+            """,
+                body.attemptId,
+                body.model_dump_json(),
+                version,
+                isinstance(body.cost, KnownCost),
+            )
+
+    async def recovery_candidates(self) -> Sequence[AttemptRow]:
+        async with self.transaction() as tx:
+            rows = await tx.query_raw(
+                """
+                WITH due AS (
+                    SELECT c.attempt_id FROM litellm_usage.recovery c
+                    JOIN litellm_usage.attempt a ON a.id=c.attempt_id
+                    JOIN litellm_usage.request r ON r.id=a.request_id
+                    WHERE NOT c.completed AND c.next_at <= now() AND r.closed_at IS NOT NULL
+                      AND (c.lease_until IS NULL OR c.lease_until < now())
+                    ORDER BY c.next_at,c.attempt_id LIMIT 100 FOR UPDATE OF c SKIP LOCKED
+                ), claimed AS (
+                    UPDATE litellm_usage.recovery c SET lease_owner=$1,
+                        lease_until=now()+interval '30 seconds', attempts=attempts+1,
+                        next_at=now()+LEAST(3600, power(2,LEAST(attempts,12))) * interval '1 second'
+                    FROM due WHERE c.attempt_id=due.attempt_id RETURNING c.attempt_id
+                ) SELECT a.* FROM litellm_usage.attempt a JOIN claimed c ON c.attempt_id=a.id
+            """,
+                self.instance_id,
+            )
+            return ATTEMPTS.validate_python(rows)
+
+    async def request_for(self, attempt: AttemptRow) -> RequestRow:
         rows = await self.database.writer_db.query_raw(
-            "\n            SELECT r.* FROM litellm_usage.request r LEFT JOIN litellm_usage.instance i ON i.id=r.instance_id\n            WHERE r.closed_at IS NULL AND (i.heartbeat_at IS NULL OR i.heartbeat_at < now()-interval '60 seconds')\n              AND r.started_at < now()-interval '60 seconds' ORDER BY r.started_at LIMIT 100\n        "
+            "SELECT * FROM litellm_usage.request WHERE id=$1", attempt.request_id
         )
-        return REQUESTS.validate_python(rows)
+        return REQUESTS.validate_python(rows)[0]
+
+    async def spend_log(self, attempt: AttemptRow) -> Mapping[str, object] | None:
+        retained = await self.database.writer_db.query_raw(
+            "SELECT source_payload FROM litellm_usage.recovery WHERE attempt_id=$1", attempt.id
+        )
+        stored = TypeAdapter(Sequence[Mapping[str, object]]).validate_python(retained)
+        source = (
+            TypeAdapter(Mapping[str, object]).validate_python(stored[0]["source_payload"])
+            if stored and stored[0]["source_payload"] is not None
+            else None
+        )
+        tables = await self.database.writer_db.query_raw("SELECT to_regclass('\"LiteLLM_SpendLogs\"')::text AS name")
+        if not TypeAdapter(Sequence[Mapping[str, str | None]]).validate_python(tables)[0]["name"]:
+            return source
+        rows = await self.database.writer_db.query_raw(
+            """
+            SELECT request_id, "startTime", "endTime", "completionStartTime", prompt_tokens,
+                   completion_tokens, metadata, spend, model_id, status, call_type
+            FROM "LiteLLM_SpendLogs" WHERE request_id=$1 LIMIT 1
+        """,
+            attempt.log_id,
+        )
+        found = TypeAdapter(Sequence[Mapping[str, object]]).validate_python(rows)
+        if not found:
+            return source
+        return MappingProxyType({**found[0], "journal_stream": source.get("journal_stream") if source else None})
+
+    async def retain_source(self, attempt: AttemptRow, payload: Mapping[str, object]) -> None:
+        encoded = TypeAdapter(Mapping[str, object]).dump_json(payload).decode()
+        await self.database.writer_db.execute_raw(
+            """
+            UPDATE litellm_usage.recovery SET source_payload=$2::jsonb
+            WHERE attempt_id=$1 AND source_payload IS NULL
+        """,
+            attempt.id,
+            encoded,
+        )

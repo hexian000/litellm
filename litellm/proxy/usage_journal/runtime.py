@@ -18,7 +18,7 @@ from prisma.errors import PrismaError
 from pydantic import BaseModel, TypeAdapter
 
 from .lifecycle import AttemptHandle, RequestHandle, configure, persist
-from .protocol import PROTOCOL, UnknownUsage, UsageBatch
+from .protocol import PROTOCOL, UnknownUsage, UsageBatch, contract_digest
 from .runtime_types import IncomingRequest
 from .store import ATTEMPTS, Database, Delivery, DeliveryResult, Store
 
@@ -45,7 +45,10 @@ def authorize(request: IncomingRequest) -> None:
     supplied = request.headers.get("x-guangrouter-usage-token", "")
     if not token or not secrets.compare_digest(token, supplied):
         raise HTTPException(403, "Invalid usage journal service credential")
-    if request.headers.get("x-guangrouter-usage-protocol") != PROTOCOL:
+    if (
+        request.headers.get("x-guangrouter-usage-protocol") != PROTOCOL
+        or request.headers.get("x-guangrouter-usage-contract") != contract_digest()
+    ):
         raise HTTPException(409, "Unsupported usage protocol")
 
 
@@ -57,7 +60,9 @@ async def deliver(store: Store, client: httpx.AsyncClient, url: str, token: str)
         response = await client.post(
             url,
             json=UsageBatch(events=tuple(d.payload for d in deliveries)).model_dump(mode="json"),
-            headers=MappingProxyType({"Authorization": f"Bearer {token}"}),
+            headers=MappingProxyType(
+                {"Authorization": f"Bearer {token}", "X-GuangRouter-Usage-Contract": contract_digest()}
+            ),
         )
         if response.status_code in frozenset((400, 422)):
             await store.complete(
@@ -94,25 +99,35 @@ async def recover(store: Store) -> None:
             )
         )
         for attempt in attempts:
-            await persist(handle, AttemptHandle(attempt, usage=UnknownUsage(state="unknown", reason="process_lost")))
-        await store.close(row, "failure")
+            await persist(
+                handle,
+                AttemptHandle(
+                    attempt, usage=UnknownUsage(state="unknown", reason="process_lost"), outcome="unknown", called=None
+                ),
+            )
+        await store.close(row, "unknown")
 
 
 async def run(store: Store, url: str, token: str) -> None:
     async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
         last_maintenance = datetime.min.replace(tzinfo=UTC)
+        delay = 0.05
         while True:
             try:
                 now = datetime.now(UTC)
                 if (now - last_maintenance).total_seconds() >= 10:
                     await store.heartbeat(int(os.getenv("LITELLM_USAGE_MAX_BYTES", str(10 * 1024**3))))
                     await recover(store)
+                    from .evidence import recover_evidence
+
+                    await recover_evidence(store)
                     last_maintenance = now
-                await deliver(store, client, url, token)
+                processed = await deliver(store, client, url, token)
+                delay = 0.05 if processed else min(1.0, delay * 2)
             except (PrismaError, httpx.HTTPError, OSError, RuntimeError, ValueError) as error:
                 logger.error("usage worker retrying error=%s", type(error).__name__)
                 await asyncio.sleep(1)
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(delay)
 
 
 @dataclass
@@ -133,7 +148,7 @@ async def start(database: Database | None) -> None:
         raise RuntimeError("usage delivery requires the existing database and service token")
     store = Store(database, f"{socket.gethostname()}-{uuid4()}", int(os.getenv("LITELLM_USAGE_MAX_PENDING", "100000")))
     if not await store.check_version():
-        raise RuntimeError("usage journal migration 001 is required before candidate startup")
+        raise RuntimeError("usage journal migrations 001 and 002 are required before candidate startup")
     await store.heartbeat(int(os.getenv("LITELLM_USAGE_MAX_BYTES", str(10 * 1024**3))))
     _state.store = store
     configure(store)
@@ -156,4 +171,6 @@ async def capability(request: Request) -> Mapping[str, str]:
         raise HTTPException(403, "Invalid usage service credential")
     if _state.store is None or not await _state.store.check_version():
         raise HTTPException(503, "Durable usage journal is unavailable")
-    return MappingProxyType({"protocol": PROTOCOL, "instanceId": _state.store.instance_id})
+    return MappingProxyType(
+        {"protocol": PROTOCOL, "instanceId": _state.store.instance_id, "contractDigest": contract_digest()}
+    )
