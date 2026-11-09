@@ -201,10 +201,11 @@ class LoggingCallbackManager:
             cached_logger = _generic_api_logger_cache.get(callback)
             if (
                 isinstance(cached_logger, GenericAPILogger)
+                and cached_logger.callback_name == callback
                 and cached_logger.endpoint == endpoint
-                and cached_logger.headers == headers
+                and cached_logger.headers == cached_logger._get_headers(headers)
                 and cached_logger.event_types == event_types
-                and cached_logger.log_format == log_format
+                and cached_logger.log_format == (log_format if log_format is not None else "json_array")
                 and cached_logger.max_retries == max_retries
                 and cached_logger.retry_delay == retry_delay
                 and cached_logger.timeout == timeout
@@ -212,6 +213,8 @@ class LoggingCallbackManager:
                 return cached_logger
 
             new_logger = GenericAPILogger(
+                callback_name=callback,
+                load_builtin_config=False,
                 endpoint=endpoint,
                 headers=headers,
                 event_types=event_types,

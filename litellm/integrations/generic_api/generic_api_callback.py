@@ -104,6 +104,8 @@ class GenericAPILogger(CustomBatchLogger):
         max_retries: int = 0,
         retry_delay: float = 1.0,
         timeout: float | httpx.Timeout | None = None,
+        *,
+        load_builtin_config: bool = True,
         **kwargs,
     ):
         """
@@ -122,7 +124,7 @@ class GenericAPILogger(CustomBatchLogger):
         #########################################################
         # Check if callback_name is provided and load config
         #########################################################
-        if callback_name:
+        if callback_name and load_builtin_config:
             if is_callback_compatible(callback_name):
                 verbose_logger.debug(f"Loading configuration for callback: {callback_name}")
                 callback_config = get_callback_config(callback_name)

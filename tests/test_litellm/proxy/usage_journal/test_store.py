@@ -860,23 +860,34 @@ async def test_incremental_feature_migration_preserves_original_journal(store, m
 
 
 @pytest.mark.parametrize("mode,suppressed", [("active", True), ("shadow", False)])
-async def test_only_active_journal_owns_the_legacy_business_callback(store, mode, suppressed):
+@pytest.mark.parametrize("callback_name", ["workbench_model_control", "other_business_callback"])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_only_active_journal_owns_the_legacy_business_callback(
+    store: Store, mode: str, suppressed: bool, callback_name: str, failed: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from datetime import UTC, datetime
 
+    import litellm
     from litellm.integrations.generic_api.generic_api_callback import GenericAPILogger
+    from litellm.litellm_core_utils import logging_callback_manager
     from litellm.proxy.usage_journal.lifecycle import RequestHandle, current_request
 
     row = await start(store)
     row = row.model_copy(update={"mode": mode})
-    logger = GenericAPILogger(
-        endpoint="http://receiver/events", callback_name="workbench_model_control", batch_size=100
-    )
+    monkeypatch.setattr(litellm, "DEFAULT_BATCH_SIZE", 100)
+    monkeypatch.setattr(logging_callback_manager, "_generic_api_logger_cache", {})
+    monkeypatch.setitem(litellm.callback_settings, callback_name, {
+        "callback_type": "generic_api", "endpoint": "http://receiver/events", "headers": {},
+    })
+    logger = logging_callback_manager.LoggingCallbackManager._add_custom_callback_generic_api_str(callback_name)
+    assert isinstance(logger, GenericAPILogger)
     token = current_request.set(RequestHandle(store, row))
     try:
-        await logger.async_log_success_event(
+        callback = logger.async_log_failure_event if failed else logger.async_log_success_event
+        await callback(
             {"standard_logging_object": {"id": "test"}}, {}, datetime.now(UTC), datetime.now(UTC)
         )
-        assert bool(logger.log_queue) is not suppressed
+        assert bool(logger.log_queue) is not (suppressed and callback_name == "workbench_model_control")
     finally:
         current_request.reset(token)
 

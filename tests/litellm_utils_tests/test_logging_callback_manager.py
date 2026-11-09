@@ -418,6 +418,7 @@ async def test_generic_api_callback_settings_retry_config():
         )
 
         assert isinstance(result, GenericAPILogger)
+        assert result.callback_name == callback_name
         assert result.endpoint == "https://example.com/api/logs"
         assert result.headers == {"Content-Type": "application/json"}
         assert result.max_retries == 2
@@ -426,3 +427,30 @@ async def test_generic_api_callback_settings_retry_config():
     finally:
         litellm.callback_settings.pop(callback_name, None)
         _generic_api_logger_cache.pop(callback_name, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_name", ["configured_callback", "sumologic"])
+async def test_callback_settings_reuses_normalized_headers_and_format(
+    monkeypatch: pytest.MonkeyPatch, callback_name: str
+) -> None:
+    from litellm.integrations.generic_api.generic_api_callback import GenericAPILogger
+    from litellm.litellm_core_utils import logging_callback_manager
+
+    monkeypatch.setattr(logging_callback_manager, "_generic_api_logger_cache", {})
+    monkeypatch.setitem(litellm.callback_settings, callback_name, {
+        "callback_type": "generic_api",
+        "endpoint": "https://example.com/events",
+        "headers": {"Authorization": "Bearer test"},
+    })
+    first = LoggingCallbackManager._add_custom_callback_generic_api_str(callback_name)
+    assert isinstance(first, GenericAPILogger)
+    assert first.headers["Content-Type"] == "application/json"
+    assert first.log_format == "json_array"
+    assert first.event_types is None
+    assert LoggingCallbackManager._add_custom_callback_generic_api_str(callback_name) is first
+    monkeypatch.setitem(litellm.callback_settings, callback_name, {
+        **litellm.callback_settings[callback_name], "log_format": "",
+    })
+    with pytest.raises(ValueError, match="Invalid log_format"):
+        LoggingCallbackManager._add_custom_callback_generic_api_str(callback_name)
