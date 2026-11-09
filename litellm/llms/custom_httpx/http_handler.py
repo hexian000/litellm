@@ -6,7 +6,8 @@ import socket
 import ssl
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -18,6 +19,7 @@ import httpx
 from aiohttp import ClientSession, TCPConnector
 from httpx import USE_CLIENT_DEFAULT, AsyncHTTPTransport, HTTPTransport
 from httpx._types import RequestFiles
+from pydantic import TypeAdapter
 
 import litellm
 from litellm._logging import verbose_logger
@@ -501,6 +503,17 @@ class MaskedHTTPStatusError(httpx.HTTPStatusError):
         self.status_code = original_error.response.status_code
 
 
+async def capture_journal_response(response: httpx.Response) -> None:
+    if "litellm.proxy.usage_journal.lifecycle" not in sys.modules:
+        return
+    from litellm.proxy.usage_journal.transport import capture_provider_response
+
+    await capture_provider_response(response)
+
+
+JOURNAL_RESPONSE_HOOKS = TypeAdapter(list[Callable[..., Awaitable[None]]])
+
+
 class AsyncHTTPHandler:
     def __init__(
         self,
@@ -512,10 +525,17 @@ class AsyncHTTPHandler:
         shared_session: Optional["ClientSession"] = None,
     ):
         self.timeout = timeout
-        self.event_hooks = event_hooks
+        self.event_hooks = MappingProxyType(
+            {
+                **(event_hooks or MappingProxyType({})),
+                "response": JOURNAL_RESPONSE_HOOKS.validate_python(
+                    (capture_journal_response, *(event_hooks.get("response", ()) if event_hooks else ()))
+                ),
+            }
+        )
         self.client = self.create_client(
             timeout=timeout,
-            event_hooks=event_hooks,
+            event_hooks=self.event_hooks,
             ssl_verify=ssl_verify,
             shared_session=shared_session,
         )

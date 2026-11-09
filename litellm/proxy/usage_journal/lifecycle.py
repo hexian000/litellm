@@ -104,6 +104,10 @@ class AttemptHandle:
     persisted: bool = False
     called: bool | None = False
     body: Attempt | None = None
+    supplier_response_seen: bool = False
+    supplier_usage: KnownUsage | UnknownUsage = field(
+        default_factory=lambda: UnknownUsage(state="unknown", reason="supplier_usage_unproven")
+    )
 
 
 @dataclass
@@ -220,6 +224,8 @@ async def end_attempt(attempt: AttemptHandle | None, token: Token[AttemptHandle 
     attempt.usage = (
         KnownUsage(state="known", promptTokens=0, completionTokens=0, cacheReadTokens=0)
         if result is None and (not attempt.called)
+        else attempt.supplier_usage
+        if attempt.called
         else usage_from(result)
     )
     attempt.outcome = (
@@ -244,11 +250,18 @@ async def close_request(
     for attempt in handle.attempts:
         if attempt.streaming:
             attempt.usage = (
-                stream_usage(attempt.result)
+                attempt.supplier_usage
+                if attempt.called
+                else stream_usage(attempt.result)
                 if outcome == "success" and attempt is handle.attempts[-1]
                 else UnknownUsage(state="unknown", reason="stream_interrupted")
             )
-            if isinstance(attempt.usage, UnknownUsage) and wire_usage is not None and (attempt is handle.attempts[-1]):
+            if (
+                not attempt.called
+                and isinstance(attempt.usage, UnknownUsage)
+                and wire_usage is not None
+                and attempt is handle.attempts[-1]
+            ):
                 attempt.usage = wire_usage
             attempt.outcome = outcome
             try:
@@ -285,6 +298,7 @@ class WireUsage:
         self.buffer = (self.buffer + text).replace("\r\n", "\n")
         if len(self.buffer) > 1048576:
             self.buffer = ""
+            self.failed = True
             return
         while "\n\n" in self.buffer:
             frame, self.buffer = self.buffer.split("\n\n", 1)
@@ -297,6 +311,8 @@ class WireUsage:
             try:
                 payload = OBJECTS.validate_json(data)
             except (ValueError, ValidationError):
+                if data:
+                    self.failed = True
                 continue
             self._payload(payload)
 
@@ -322,6 +338,8 @@ class WireUsage:
             self.usage = MappingProxyType(MappingProxyType({**self.usage, **fields(payload.get("usage"))}))
 
     def result(self) -> KnownUsage | UnknownUsage:
+        if self.failed:
+            return UnknownUsage(state="unknown", reason="stream_failed")
         if not self.complete:
             return UnknownUsage(state="unknown", reason="stream_interrupted")
         return usage_from(MappingProxyType({"usage": self.usage}))
