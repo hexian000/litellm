@@ -59,10 +59,19 @@ async def capture_provider_response(response: httpx.Response) -> None:
     ):
         return
     attempt.supplier_response_seen = True
-    if "text/event-stream" in TEXT.validate_python(response.headers.get("content-type", "")).lower():
+    content_type = TEXT.validate_python(response.headers.get("content-type", "")).lower().split(";", 1)[0].strip()
+    if content_type == "text/event-stream":
         decode = decoder(TEXT.validate_python(response.headers.get("content-encoding", "")).strip().lower())
         if decode is not None and isinstance(response.stream, httpx.AsyncByteStream):
             response.stream = SupplierStream(response.stream, attempt, decode)
+        return
+    if content_type not in ("", "application/json") and not content_type.endswith("+json"):
+        return
+    try:
+        request_body = OBJECTS.validate_json(response.request.content)
+    except (httpx.RequestNotRead, ValueError):
+        return
+    if request_body.get("stream") is True:
         return
     await response.aread()
     try:

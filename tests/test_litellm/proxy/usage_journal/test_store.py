@@ -283,6 +283,30 @@ async def test_cancelled_stream_does_not_accept_estimated_outgoing_usage(store: 
     assert stored[0]["body"]["usage"]["state"] == "unknown"
 
 
+@pytest.mark.parametrize("content_type", ("application/x-ndjson", "application/octet-stream", "application/json"))
+async def test_supplier_capture_keeps_non_sse_stream_unread(store: Store, content_type: str) -> None:
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from litellm.proxy.usage_journal.lifecycle import AttemptHandle, current_attempt
+
+    row = await start(store)
+    attempt = await store.begin_attempt(
+        row, attempt_id=str(uuid4()), model="provider/model", group="model", deployment=None, provider=None
+    )
+    handle = AttemptHandle(attempt, called=True)
+    token = current_attempt.set(handle)
+    handler = AsyncHTTPHandler()
+    body = b'{"token":"pong"}\n{"token":"more"}\n'
+    try:
+        async with supplier_api(body, content_type) as base, handler.client as client:
+            request = client.build_request("POST", base, json={"stream": True})
+            response = await client.send(request, stream=True)
+            assert not response.is_stream_consumed
+            assert await response.aread() == body
+            assert isinstance(handle.supplier_usage, UnknownUsage)
+    finally:
+        current_attempt.reset(token)
+
+
 @pytest.mark.parametrize("provenance", (None, {"state": "unknown", "reason": "stream_interrupted"}))
 async def test_recovery_cannot_promote_sdk_estimates_to_supplier_evidence(store: Store, provenance) -> None:
     from datetime import timedelta
