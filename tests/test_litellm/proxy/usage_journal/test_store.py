@@ -13,8 +13,10 @@ import httpx
 import pytest
 import pytest_asyncio
 from prisma import Prisma
+from prisma.types import DatasourceOverride
 from pydantic import TypeAdapter
 
+from litellm.proxy.db.prisma_batch import EngineAccess, PrismaBatch
 from litellm.proxy.db.prisma_client import default_prisma_http_config
 from litellm.proxy.usage_journal.lifecycle import WireUsage, usage_from
 from litellm.proxy.usage_journal.protocol import Attempt, KnownUsage, UnknownUsage, UsageBatch, contract_digest
@@ -44,16 +46,21 @@ async def test_default_transport_survives_prisma_disconnect_and_reconnect() -> N
         await db.disconnect()
 
 
-@pytest_asyncio.fixture(loop_scope="function")
-async def store() -> AsyncIterator[Store]:
+@pytest_asyncio.fixture(loop_scope="function", params=(False, True), ids=("interactive", "batch"))
+async def store(request: pytest.FixtureRequest) -> AsyncIterator[Store]:
     url = os.environ.get("LITELLM_USAGE_TEST_DATABASE_URL")
     if not url:
         pytest.skip("requires migrated isolated PostgreSQL LITELLM_USAGE_TEST_DATABASE_URL")
-    db = Prisma(datasource={"url": url}, http=default_prisma_http_config())
+    db = Prisma(datasource=DatasourceOverride(url=url), http=default_prisma_http_config())
     await db.connect()
     instance = f"test-{uuid4()}"
     try:
-        yield Store(Database(db), instance)
+        atomic = (
+            PrismaBatch(lambda: EngineAccess.model_validate(db).engine)
+            if TypeAdapter(bool).validate_python(request.param)
+            else None
+        )
+        yield Store(Database(db), instance, atomic=atomic)
     finally:
         owned = TypeAdapter(list[dict[str, str]]).validate_python(await db.query_raw(
             "SELECT request_id FROM litellm_usage.outbox WHERE payload->>'instanceId'=$1 "
@@ -86,6 +93,39 @@ async def start(store: Store):
             mode="active",
         )
     )
+
+
+async def test_closed_request_cannot_gain_an_attempt_from_a_prepared_batch(store: Store) -> None:
+    row = await start(store)
+    await store.close(row, "success")
+    with pytest.raises(RuntimeError, match="closed"):
+        await store.begin_attempt(
+            row, attempt_id=uuid4().hex, model="provider/model", group="model", deployment=None, provider="provider"
+        )
+    assert await store.database.writer_db.query_raw(
+        "SELECT id FROM litellm_usage.attempt WHERE request_id=$1", row.id
+    ) == []
+    closed = await store.database.writer_db.query_raw(
+        "SELECT payload->'body'->'attemptIds' AS members FROM litellm_usage.outbox WHERE event_id=$1",
+        f"{row.id}/closed",
+    )
+    assert closed == [{"members": []}]
+
+
+async def test_version_capability_reads_live_revision_and_missing_feature_tables(store: Store) -> None:
+    assert await store.check_version()
+    await store.database.writer_db.execute_raw("UPDATE litellm_usage.feature_revision SET version=3 WHERE version=2")
+    try:
+        assert not await store.check_version()
+    finally:
+        await store.database.writer_db.execute_raw("UPDATE litellm_usage.feature_revision SET version=2 WHERE version=3")
+    name = f"feature_backup_{uuid4().hex}"
+    await store.database.writer_db.execute_raw(f'ALTER TABLE litellm_usage.feature_revision RENAME TO "{name}"')
+    try:
+        assert not await store.check_version()
+    finally:
+        await store.database.writer_db.execute_raw(f'ALTER TABLE litellm_usage."{name}" RENAME TO feature_revision')
+    assert await store.check_version()
 
 
 def supplier_metadata(prompt: int, completion: int) -> Mapping[str, object]:
