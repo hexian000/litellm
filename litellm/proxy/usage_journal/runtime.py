@@ -16,6 +16,7 @@ from fastapi import HTTPException, Request
 from prisma.errors import PrismaError
 from pydantic import BaseModel, TypeAdapter
 
+from ..db.prisma_batch import EngineAccess, PrismaBatch
 from .lifecycle import AttemptHandle, RequestHandle, configure, persist
 from .protocol import PROTOCOL, UnknownUsage, UsageBatch, contract_digest
 from .runtime_types import IncomingRequest
@@ -159,7 +160,12 @@ async def start(database: Database | None) -> None:
         return
     if database is None or not token:
         raise RuntimeError("usage delivery requires the existing database and service token")
-    store = Store(database, f"{socket.gethostname()}-{uuid4()}", int(os.getenv("LITELLM_USAGE_MAX_PENDING", "100000")))
+    store = Store(
+        database,
+        f"{socket.gethostname()}-{uuid4()}",
+        int(os.getenv("LITELLM_USAGE_MAX_PENDING", "100000")),
+        atomic=PrismaBatch(lambda: EngineAccess.model_validate(database.writer_db).engine),
+    )
     if not await store.check_version():
         raise RuntimeError("usage journal migrations 001 and 002 are required before candidate startup")
     await store.heartbeat(int(os.getenv("LITELLM_USAGE_MAX_BYTES", str(10 * 1024**3))))

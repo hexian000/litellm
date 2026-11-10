@@ -10,6 +10,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, TypeAdapter
 
+from ..db.prisma_batch import ROWS, TIMEOUTS, Atomic, Rows, Statement
 from .protocol import PROTOCOL, Attempt, Closed, KnownCost, Observation, Started, UsageEvent
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,14 @@ class Database(Protocol):
 
     @property
     def writer_db(self) -> Sql: ...
+
+
+async def _query_sequence(tx: Sql, statements: tuple[Statement, ...]) -> tuple[Rows, ...]:
+    if not statements:
+        return ()
+    first = ROWS.validate_python(await tx.query_raw(statements[0].query, *statements[0].parameters))
+    remaining = await _query_sequence(tx, statements[1:])
+    return (first, *remaining)
 
 
 class Admission(BaseModel):
@@ -76,9 +85,16 @@ class Delivery(BaseModel):
     attempts: int
 
 
+class Revision(BaseModel):
+    version: int
+    name: str | None
+
+
 REQUESTS = TypeAdapter(Sequence[RequestRow])
 ATTEMPTS = TypeAdapter(Sequence[AttemptRow])
 DELIVERIES = TypeAdapter(Sequence[Delivery])
+REVISIONS = TypeAdapter(tuple[Revision, ...])
+VERSIONS = TypeAdapter(tuple[Mapping[str, int], ...])
 
 
 def _retain_native_first_response(previous: Observation | None, body: Observation) -> Observation:
@@ -103,33 +119,41 @@ class DeliveryResult(BaseModel):
 
 
 class Store:
-    def __init__(self, database: Database, instance_id: str, max_pending: int = 100000) -> None:
+    def __init__(
+        self, database: Database, instance_id: str, max_pending: int = 100000, *, atomic: Atomic | None = None
+    ) -> None:
         self.database = database
         self.instance_id = instance_id
         self.max_pending = max_pending
         self._transactions = asyncio.Semaphore(4)
+        self._atomic = atomic
 
     @asynccontextmanager
     async def transaction(self) -> AsyncGenerator[Sql]:
         async with self._transactions, self.database.tx() as tx:
-            await tx.query_raw(
-                "SELECT set_config('lock_timeout', '2s', true), set_config('statement_timeout', '5s', true)"
-            )
+            await tx.query_raw(TIMEOUTS.query)
             yield tx
 
+    async def query_transaction(self, *statements: Statement) -> tuple[Rows, ...]:
+        async with self._transactions:
+            if self._atomic is not None:
+                return await self._atomic(statements)
+            async with self.database.tx() as tx:
+                await tx.query_raw(TIMEOUTS.query)
+                return await _query_sequence(tx, statements)
+
     async def check_version(self) -> bool:
-        rows = await self.database.writer_db.query_raw("SELECT version FROM litellm_usage.revision")
-        if tuple(row["version"] for row in TypeAdapter(Sequence[Mapping[str, int]]).validate_python(rows)) != (1,):
-            return False
-        feature = await self.database.writer_db.query_raw(
-            "SELECT to_regclass('litellm_usage.feature_revision')::text AS name"
+        rows = REVISIONS.validate_python(
+            await self.database.writer_db.query_raw(
+                "SELECT version,to_regclass('litellm_usage.feature_revision')::text AS name FROM litellm_usage.revision"
+            )
         )
-        if not TypeAdapter(Sequence[Mapping[str, str | None]]).validate_python(feature)[0]["name"]:
+        if tuple(row.version for row in rows) != (1,):
+            return False
+        if not rows[0].name:
             return False
         versions = await self.database.writer_db.query_raw("SELECT version FROM litellm_usage.feature_revision")
-        return tuple(row["version"] for row in TypeAdapter(Sequence[Mapping[str, int]]).validate_python(versions)) == (
-            2,
-        )
+        return tuple(row["version"] for row in VERSIONS.validate_python(versions)) == (2,)
 
     def event(
         self, request: RequestRow, body: Started | Attempt | Closed | Observation, version: int = 1
@@ -242,17 +266,14 @@ class Store:
         deployment: str | None,
         provider: str | None,
     ) -> AttemptRow:
-        async with self.transaction() as tx:
-            open_rows = await tx.query_raw(
-                "SELECT id FROM litellm_usage.request WHERE id=$1 AND closed_at IS NULL "
+        open_rows, rows = await self.query_transaction(
+            Statement(
+                query="SELECT id FROM litellm_usage.request WHERE id=$1 AND closed_at IS NULL "
                 "AND instance_id=$2 FOR NO KEY UPDATE",
-                request.id,
-                self.instance_id,
-            )
-            if not open_rows:
-                raise RuntimeError("request journal closed; provider call refused")
-            rows = await tx.query_raw(
-                """
+                parameters=(request.id, self.instance_id),
+            ),
+            Statement(
+                query="""
                 WITH capacity AS (
                     SELECT id FROM litellm_usage.control
                     WHERE id=1 AND admitted AND pending+open_requests+unknown_attempts < $7 FOR UPDATE
@@ -263,7 +284,10 @@ class Store:
                         CASE WHEN count(*)=0 THEN 'primary'
                              WHEN bool_and(model=$3) THEN 'retry' ELSE 'fallback' END
                     FROM litellm_usage.attempt WHERE request_id=$2
-                    HAVING EXISTS(SELECT 1 FROM capacity) RETURNING *
+                    HAVING EXISTS(SELECT 1 FROM capacity)
+                        AND EXISTS(SELECT 1 FROM litellm_usage.request
+                                   WHERE id=$2 AND closed_at IS NULL AND instance_id=$8)
+                    RETURNING *
                 ), recovery AS (
                     INSERT INTO litellm_usage.recovery(attempt_id) SELECT id FROM inserted RETURNING attempt_id
                 ), counted AS (
@@ -272,18 +296,24 @@ class Store:
                 )
                 SELECT inserted.* FROM inserted CROSS JOIN counted
                 """,
-                attempt_id,
-                request.id,
-                model,
-                group,
-                deployment,
-                provider,
-                self.max_pending,
-            )
-            attempts = ATTEMPTS.validate_python(rows)
-            if not attempts:
-                raise RuntimeError("request journal closed or usage journal capacity exhausted; provider call refused")
-            return attempts[0]
+                parameters=(
+                    attempt_id,
+                    request.id,
+                    model,
+                    group,
+                    deployment,
+                    provider,
+                    self.max_pending,
+                    self.instance_id,
+                ),
+            ),
+        )
+        if not open_rows:
+            raise RuntimeError("request journal closed; provider call refused")
+        attempts = ATTEMPTS.validate_python(rows)
+        if not attempts:
+            raise RuntimeError("request journal closed or usage journal capacity exhausted; provider call refused")
+        return attempts[0]
 
     async def finish(self, request: RequestRow, attempt: AttemptRow, body: Attempt) -> Attempt:
         async with self.transaction() as tx:
@@ -381,20 +411,21 @@ class Store:
             )
 
     async def claim(self) -> Sequence[Delivery]:
-        async with self.transaction() as tx:
-            rows = await tx.query_raw(
-                "\n                WITH due AS (SELECT id FROM litellm_usage.outbox\n                    WHERE disposition='pending' AND next_attempt_at <= now()\n                      AND (lease_until IS NULL OR lease_until < now())\n                    ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 100)\n                UPDATE litellm_usage.outbox o SET lease_owner=$1, lease_until=now()+interval '30 seconds'\n                FROM due WHERE o.id=due.id RETURNING o.id, o.payload, o.attempts\n            ",
-                self.instance_id,
+        (rows,) = await self.query_transaction(
+            Statement(
+                query="\n                WITH due AS (SELECT id FROM litellm_usage.outbox\n                    WHERE disposition='pending' AND next_attempt_at <= now()\n                      AND (lease_until IS NULL OR lease_until < now())\n                    ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 100)\n                UPDATE litellm_usage.outbox o SET lease_owner=$1, lease_until=now()+interval '30 seconds'\n                FROM due WHERE o.id=due.id RETURNING o.id, o.payload, o.attempts\n            ",
+                parameters=(self.instance_id,),
             )
-            return DELIVERIES.validate_python(rows)
+        )
+        return DELIVERIES.validate_python(rows)
 
     async def complete(self, results: Sequence[DeliveryResult]) -> None:
         if not results:
             return
         encoded = TypeAdapter(Sequence[DeliveryResult]).dump_json(results).decode()
-        async with self.transaction() as tx:
-            await tx.execute_raw(
-                """
+        await self.query_transaction(
+            Statement(
+                query="""
                 WITH acknowledgements AS (
                     SELECT * FROM jsonb_to_recordset($1::jsonb)
                     AS a(id bigint, status text, reason text, delay_ms integer)
@@ -415,9 +446,9 @@ class Store:
                 UPDATE litellm_usage.control SET pending=pending-(
                     SELECT count(*) FROM updated WHERE disposition='delivered') WHERE id=1
             """,
-                encoded,
-                self.instance_id,
+                parameters=(encoded, self.instance_id),
             )
+        )
         for result in results:
             if result.status in ("rejected", "conflict"):
                 logger.error("usage delivery quarantined id=%s reason=%s", result.id, result.reason)
@@ -434,23 +465,24 @@ class Store:
         await self.complete((self.retry_result(delivery),))
 
     async def heartbeat(self, max_bytes: int) -> None:
-        async with self.transaction() as tx:
-            await tx.execute_raw(
-                "\n                INSERT INTO litellm_usage.instance(id) VALUES ($1)\n                ON CONFLICT(id) DO UPDATE SET heartbeat_at=now()\n            ",
-                self.instance_id,
-            )
-            await tx.execute_raw(
-                "\n                UPDATE litellm_usage.control SET admitted=(\n                    pg_total_relation_size('litellm_usage.outbox') + pg_total_relation_size('litellm_usage.attempt')\n                    + pg_total_relation_size('litellm_usage.request') + pg_total_relation_size('litellm_usage.recovery') < $1) WHERE id=1\n            ",
-                max_bytes,
-            )
-            await tx.execute_raw(
-                "\n                UPDATE litellm_usage.outbox SET payload=NULL WHERE id IN (\n                    SELECT o.id FROM litellm_usage.outbox o JOIN litellm_usage.request r ON r.id=o.request_id\n                    WHERE o.disposition='delivered' AND o.delivered_at < now()-interval '24 hours'\n                      AND o.payload IS NOT NULL AND r.closed_at IS NOT NULL AND NOT r.conflicted\n                      AND NOT EXISTS(SELECT 1 FROM litellm_usage.attempt a WHERE a.request_id=r.id\n                                     AND (a.ended_at IS NULL OR NOT a.usage_known))\n                    ORDER BY o.delivered_at, o.id LIMIT 1000 FOR UPDATE OF o SKIP LOCKED)\n            "
-            )
+        await self.query_transaction(
+            Statement(
+                query="\n                INSERT INTO litellm_usage.instance(id) VALUES ($1)\n                ON CONFLICT(id) DO UPDATE SET heartbeat_at=now()\n            ",
+                parameters=(self.instance_id,),
+            ),
+            Statement(
+                query="\n                UPDATE litellm_usage.control SET admitted=(\n                    pg_total_relation_size('litellm_usage.outbox') + pg_total_relation_size('litellm_usage.attempt')\n                    + pg_total_relation_size('litellm_usage.request') + pg_total_relation_size('litellm_usage.recovery') < $1) WHERE id=1\n            ",
+                parameters=(max_bytes,),
+            ),
+            Statement(
+                query="\n                UPDATE litellm_usage.outbox SET payload=NULL WHERE id IN (\n                    SELECT o.id FROM litellm_usage.outbox o JOIN litellm_usage.request r ON r.id=o.request_id\n                    WHERE o.disposition='delivered' AND o.delivered_at < now()-interval '24 hours'\n                      AND o.payload IS NOT NULL AND r.closed_at IS NOT NULL AND NOT r.conflicted\n                      AND NOT EXISTS(SELECT 1 FROM litellm_usage.attempt a WHERE a.request_id=r.id\n                                     AND (a.ended_at IS NULL OR NOT a.usage_known))\n                    ORDER BY o.delivered_at, o.id LIMIT 1000 FOR UPDATE OF o SKIP LOCKED)\n            "
+            ),
+        )
 
     async def orphaned(self) -> Sequence[RequestRow]:
-        async with self.transaction() as tx:
-            rows = await tx.query_raw(
-                """
+        (rows,) = await self.query_transaction(
+            Statement(
+                query="""
                 WITH due AS (
                     SELECT r.id FROM litellm_usage.request r
                     LEFT JOIN litellm_usage.instance i ON i.id=r.instance_id
@@ -464,9 +496,10 @@ class Store:
                 ) UPDATE litellm_usage.request r SET instance_id=$1, outcome='unknown' FROM due
                   WHERE r.id=due.id RETURNING r.*
             """,
-                self.instance_id,
+                parameters=(self.instance_id,),
             )
-            return REQUESTS.validate_python(rows)
+        )
+        return REQUESTS.validate_python(rows)
 
     async def observe(self, request: RequestRow, body: Observation) -> None:
         async with self.transaction() as tx:
@@ -534,9 +567,9 @@ class Store:
             )
 
     async def recovery_candidates(self) -> Sequence[AttemptRow]:
-        async with self.transaction() as tx:
-            rows = await tx.query_raw(
-                """
+        (rows,) = await self.query_transaction(
+            Statement(
+                query="""
                 WITH due AS (
                     SELECT c.attempt_id FROM litellm_usage.recovery c
                     JOIN litellm_usage.attempt a ON a.id=c.attempt_id
@@ -551,9 +584,10 @@ class Store:
                     FROM due WHERE c.attempt_id=due.attempt_id RETURNING c.attempt_id
                 ) SELECT a.* FROM litellm_usage.attempt a JOIN claimed c ON c.attempt_id=a.id
             """,
-                self.instance_id,
+                parameters=(self.instance_id,),
             )
-            return ATTEMPTS.validate_python(rows)
+        )
+        return ATTEMPTS.validate_python(rows)
 
     async def request_for(self, attempt: AttemptRow) -> RequestRow:
         rows = await self.database.writer_db.query_raw(
