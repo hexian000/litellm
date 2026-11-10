@@ -180,10 +180,6 @@ def mock_dual_cache() -> MagicMock:
 def patched_prisma_import(monkeypatch: pytest.MonkeyPatch) -> Iterator[MagicMock]:
     """Replace ``prisma.Prisma`` and ``PrismaWrapper`` so PrismaClient.__init__
     runs without a generated client. Yields the fake Prisma instance.
-
-    ``prisma`` raises RuntimeError (not AttributeError) for the missing
-    ``Prisma`` attribute, so ``monkeypatch.setattr`` can't probe it; assign
-    directly and restore in teardown.
     """
     import prisma as _prisma_pkg
     import litellm.proxy.utils as _utils_mod
@@ -194,9 +190,7 @@ def patched_prisma_import(monkeypatch: pytest.MonkeyPatch) -> Iterator[MagicMock
     fake_prisma.disconnect = AsyncMock()
 
     fake_prisma_factory = MagicMock(name="FakePrismaFactory", return_value=fake_prisma)
-    had_prisma_attr = "Prisma" in _prisma_pkg.__dict__
-    previous_prisma_attr = _prisma_pkg.__dict__.get("Prisma")
-    _prisma_pkg.Prisma = fake_prisma_factory  # type: ignore[attr-defined]
+    monkeypatch.setitem(_prisma_pkg.__dict__, "Prisma", fake_prisma_factory)
 
     fake_wrapper = MagicMock(name="FakePrismaWrapper")
     fake_wrapper.is_connected = MagicMock(return_value=False)
@@ -209,16 +203,7 @@ def patched_prisma_import(monkeypatch: pytest.MonkeyPatch) -> Iterator[MagicMock
 
     monkeypatch.setattr(_utils_mod, "PrismaWrapper", _fake_wrapper_ctor)
     fake_prisma.__wrapper__ = fake_wrapper
-    try:
-        yield fake_prisma
-    finally:
-        if had_prisma_attr:
-            _prisma_pkg.Prisma = previous_prisma_attr  # type: ignore[attr-defined]
-        else:
-            try:
-                del _prisma_pkg.Prisma  # type: ignore[attr-defined]
-            except AttributeError:
-                pass
+    yield fake_prisma
 
 
 @pytest.fixture
