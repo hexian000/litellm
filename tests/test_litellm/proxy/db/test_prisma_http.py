@@ -190,3 +190,28 @@ async def test_write_timeout_is_an_httpx_timeout() -> None:
         listener.close()
         await listener.wait_closed()
         await asyncio.wait_for(done.wait(), 1)
+
+
+async def test_malformed_engine_response_is_an_httpx_protocol_error() -> None:
+    done = asyncio.Event()
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"invalid HTTP response\r\n\r\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            done.set()
+
+    listener = await asyncio.start_server(handler, "127.0.0.1", 0)
+    _, port = TypeAdapter(tuple[str, int]).validate_python(listener.sockets[0].getsockname())
+    try:
+        async with httpx.AsyncClient(transport=PrismaEngineTransport()) as client:
+            with pytest.raises(httpx.RemoteProtocolError):
+                await client.get(f"http://127.0.0.1:{port}", timeout=1)
+    finally:
+        listener.close()
+        await listener.wait_closed()
+        await asyncio.wait_for(done.wait(), 1)

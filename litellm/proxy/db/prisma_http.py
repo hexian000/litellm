@@ -124,6 +124,8 @@ class PrismaEngineTransport(httpx.AsyncBaseTransport):
             raise httpx.WriteTimeout(str(error), request=request) from error
         except aiohttp.ClientConnectorError as error:
             raise httpx.ConnectError(str(error), request=request) from error
+        except aiohttp.ClientResponseError as error:
+            raise httpx.RemoteProtocolError(str(error), request=request) from error
         except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as error:
             raise httpx.ReadError(str(error), request=request) from error
 
