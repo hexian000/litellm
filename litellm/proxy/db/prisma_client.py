@@ -27,7 +27,16 @@ if TYPE_CHECKING:
 def default_prisma_http_config() -> "HttpConfig":
     from prisma.types import HttpConfig
 
-    return HttpConfig(limits=httpx.Limits(max_connections=1000, max_keepalive_connections=20))
+    from .prisma_http import PrismaEngineTransport
+
+    class EngineHttpConfig(HttpConfig):
+        transport: httpx.AsyncBaseTransport
+
+    return EngineHttpConfig(
+        limits=httpx.Limits(max_connections=1000, max_keepalive_connections=20),
+        transport=PrismaEngineTransport(),
+        trust_env=False,
+    )
 
 
 @dataclass(frozen=True)

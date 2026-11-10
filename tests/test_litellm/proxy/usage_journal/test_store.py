@@ -15,6 +15,7 @@ import pytest_asyncio
 from prisma import Prisma
 from pydantic import TypeAdapter
 
+from litellm.proxy.db.prisma_client import default_prisma_http_config
 from litellm.proxy.usage_journal.lifecycle import WireUsage, usage_from
 from litellm.proxy.usage_journal.protocol import Attempt, KnownUsage, UnknownUsage, UsageBatch, contract_digest
 from litellm.proxy.usage_journal.runtime import deliver
@@ -29,12 +30,26 @@ class Database:
         return self.writer_db.tx()
 
 
+async def test_default_transport_survives_prisma_disconnect_and_reconnect() -> None:
+    url = os.environ.get("LITELLM_USAGE_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("requires isolated PostgreSQL LITELLM_USAGE_TEST_DATABASE_URL")
+    db = Prisma(datasource={"url": url}, http=default_prisma_http_config())
+    try:
+        for _ in range(2):
+            await db.connect()
+            assert await db.query_raw("SELECT 1 AS value") == [{"value": 1}]
+            await db.disconnect()
+    finally:
+        await db.disconnect()
+
+
 @pytest_asyncio.fixture(loop_scope="function")
 async def store() -> AsyncIterator[Store]:
     url = os.environ.get("LITELLM_USAGE_TEST_DATABASE_URL")
     if not url:
         pytest.skip("requires migrated isolated PostgreSQL LITELLM_USAGE_TEST_DATABASE_URL")
-    db = Prisma(datasource={"url": url})
+    db = Prisma(datasource={"url": url}, http=default_prisma_http_config())
     await db.connect()
     instance = f"test-{uuid4()}"
     try:
