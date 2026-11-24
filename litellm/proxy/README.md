@@ -30,6 +30,21 @@ print(response)
 
 [**See how to call Huggingface,Bedrock,TogetherAI,Anthropic, etc.**](https://docs.litellm.ai/docs/simple_proxy)
 
+### Dynamic tag directory exclusions
+
+Use `litellm_settings.tag_list_excluded_prefixes` to hide dynamic spend tags from
+`GET /tag/list` by case-sensitive prefix. For example:
+
+```yaml
+litellm_settings:
+  tag_list_excluded_prefixes:
+    - "x-idempotency-key:"
+```
+
+The default is an empty list, which preserves the complete directory. Exclusions
+apply only to dynamically discovered tags. Explicitly stored tags, spend logs,
+daily spend records, and tag activity queries remain unchanged. Filtering happens
+when building the response; the underlying historical tag query still runs.
 
 ---
 

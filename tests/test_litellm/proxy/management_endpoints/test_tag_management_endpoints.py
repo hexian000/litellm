@@ -357,6 +357,88 @@ async def test_list_tags_with_dynamic_tags():
         app.dependency_overrides.clear()
 
 
+@pytest.mark.parametrize("role", [LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.INTERNAL_USER])
+@pytest.mark.parametrize("with_dates", [False, True])
+@pytest.mark.parametrize(
+    ("prefixes", "keep_requests", "keep_project"),
+    [
+        ((), True, True),
+        (("x-idempotency-key:",), False, True),
+        (("x-project-id:",), True, False),
+        (("x-idempotency-key:", "x-project-id:"), False, False),
+    ],
+)
+def test_list_tags_excluded_prefixes_only_hide_dynamic_tags(
+    role: LitellmUserRoles,
+    with_dates: bool,
+    prefixes: tuple[str, ...],
+    keep_requests: bool,
+    keep_project: bool,
+) -> None:
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    auth = UserAPIKeyAuth(api_key="owned-key", user_id="test-user", user_role=role)
+    app.dependency_overrides[user_api_key_auth] = lambda: auth
+    stored_name = "x-idempotency-key: manually-configured"
+    business_names = ("x-project-id: project-one", "x-idempotency-key-custom: category")
+    request_names = tuple(f"x-idempotency-key: request-{index}" for index in range(128))
+    dynamic_names = (
+        stored_name,
+        *business_names,
+        *request_names,
+    )
+    try:
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client") as prisma,
+            patch.object(litellm, "tag_list_excluded_prefixes", list(prefixes), create=True),
+        ):
+            prisma.db.litellm_verificationtoken = FakeVerificationTokenTable([Mock(token="owned-key")])
+            prisma.db.litellm_dailytagspend.group_by = AsyncMock(
+                return_value=[
+                    {
+                        "tag": name,
+                        "_min": {"created_at": "2026-01-01T00:00:00Z"},
+                        "_max": {"updated_at": "2026-01-02T00:00:00Z"},
+                    }
+                    for name in dynamic_names
+                ]
+            )
+            prisma.db.litellm_tagtable.find_many = AsyncMock(
+                return_value=[
+                    Mock(
+                        tag_name=stored_name,
+                        description="A configured tag",
+                        models=[],
+                        model_info={},
+                        created_at=datetime(2026, 1, 1),
+                        updated_at=datetime(2026, 1, 2),
+                        created_by="test-user",
+                        litellm_budget_table=None,
+                    )
+                ]
+            )
+            url = "/tag/list?start_date=2026-01-01&end_date=2026-01-02" if with_dates else "/tag/list"
+            response = client.get(url, headers={"Authorization": "Bearer test-key"})
+
+            assert response.status_code == 200, response.text
+            assert [tag["name"] for tag in response.json()] == [
+                stored_name,
+                *([business_names[0]] if keep_project else []),
+                business_names[1],
+                *(request_names if keep_requests else ()),
+            ]
+            where = prisma.db.litellm_dailytagspend.group_by.await_args.kwargs["where"]
+            if role == LitellmUserRoles.INTERNAL_USER:
+                assert where["api_key"] == {"in": ["owned-key"]}
+            if with_dates:
+                assert where["date"] == {"gte": "2026-01-01", "lte": "2026-01-02"}
+    finally:
+        app.dependency_overrides.clear()
+
+
 @pytest.mark.asyncio
 async def test_list_tags_no_dynamic_tags():
     """

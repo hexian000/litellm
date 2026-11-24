@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
@@ -955,6 +956,25 @@ def test_ProxyConfig__load_environment_variables_blocks_dangerous_keys(monkeypat
 # ---------------------------------------------------------------------------
 # ProxyConfig.load_config
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ProxyConfig_load_config_wires_tag_list_excluded_prefixes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = tmp_path / "tag-list.yaml"
+    config_file.write_text(
+        "model_list: []\ngeneral_settings: {}\nlitellm_settings:\n"
+        "  tag_list_excluded_prefixes:\n    - 'request-marker:'\n    - 'trace-marker:'\n"
+    )
+    monkeypatch.setattr(litellm, "tag_list_excluded_prefixes", [])
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.store_model_in_db", False)
+    monkeypatch.delenv("LITELLM_CONFIG_BUCKET_NAME", raising=False)
+
+    await ProxyConfig().load_config(router=None, config_file_path=str(config_file))
+
+    assert litellm.tag_list_excluded_prefixes == ["request-marker:", "trace-marker:"]
 
 
 @pytest.mark.asyncio
