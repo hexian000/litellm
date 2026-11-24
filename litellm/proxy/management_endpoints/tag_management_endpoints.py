@@ -23,6 +23,7 @@ from typing import (
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import UserAPIKeyAuth, user_api_key_has_admin_view
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -648,6 +649,7 @@ async def list_tags(
 
             list_of_tags.append(tag_dict)
 
+        excluded_prefixes = tuple(litellm.tag_list_excluded_prefixes)
         dynamic_tag_config = [
             {
                 "name": row["tag"],
@@ -657,7 +659,7 @@ async def list_tags(
                 "updated_at": row["_max"]["updated_at"],
             }
             for row in dynamic_tag_rows
-            if row["tag"] not in stored_tag_names
+            if row["tag"] not in stored_tag_names and not (row["tag"] or "").startswith(excluded_prefixes)
         ]
 
         return list_of_tags + dynamic_tag_config

@@ -28,6 +28,7 @@ if os.getenv("LITELLM_MODE", "DEV") == "DEV":
 
 from typing import (
     Callable,
+    Sequence,
     List,
     Optional,
     Dict,
@@ -325,6 +326,7 @@ anthropic_prompt_caching_ttl: Optional[Literal["5m", "1h"]] = (
 )
 disable_vertex_batch_output_transformation: bool = False
 extra_spend_tag_headers: Optional[List[str]] = None
+tag_list_excluded_prefixes: Sequence[str] = ()
 in_memory_llm_clients_cache: "LLMClientCache"
 safe_memory_mode: bool = False
 enable_azure_ad_token_refresh: Optional[bool] = False
